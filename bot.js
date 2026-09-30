@@ -49,8 +49,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => res.status(200).send('🤖 Bot Sildemar activo'));
-app.get('/health', (req, res) => res.status(200).json({ 
-    status: 'ok', 
+app.get('/health', (req, res) => res.status(200).json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
 }));
@@ -60,9 +60,11 @@ app.listen(PORT, () => {
 });
 
 // ============================================================
-// CONEXIÓN A MYSQL (INVENTARIO)
+// CONEXIÓN A MYSQL (INVENTARIO) - OPTIMIZADO PARA cPANEL
 // ============================================================
 let pool;
+let mysqlFallos = 0;
+const MYSQL_MAX_FALLOS = 5;
 
 async function conectarBD() {
     try {
@@ -73,15 +75,42 @@ async function conectarBD() {
             password: process.env.DB_PASSWORD || '',
             database: process.env.DB_NAME || 'storesil_sildemar',
             waitForConnections: true,
-            connectionLimit: 5,
-            queueLimit: 0
+            connectionLimit: 1,
+            maxIdle: 1,
+            idleTimeout: 10000,
+            queueLimit: 0,
+            connectTimeout: 15000,
+            enableKeepAlive: false,
+            decimalNumbers: true
         });
 
         const conn = await pool.getConnection();
         console.log('✅ Conexión a MySQL (inventario) establecida');
         conn.release();
     } catch (err) {
-        console.error('❌ Error conectando a MySQL:', err.message);
+        console.error('⚠️  Error conectando a MySQL:', err.message);
+        console.error('   (El bot seguirá funcionando sin inventario)');
+    }
+}
+
+async function querySegura(sql, params = []) {
+    if (!pool) return [];
+    try {
+        const [rows] = await pool.query(sql, params);
+        mysqlFallos = 0;
+        return rows;
+    } catch (err) {
+        mysqlFallos++;
+        console.error(`⚠️  Error MySQL (${mysqlFallos}/${MYSQL_MAX_FALLOS}):`, err.message);
+
+        if (mysqlFallos >= MYSQL_MAX_FALLOS) {
+            console.log('🔄 Reiniciando pool MySQL...');
+            try { await pool.end(); } catch {}
+            await new Promise(r => setTimeout(r, 5000));
+            await conectarBD();
+            mysqlFallos = 0;
+        }
+        return [];
     }
 }
 
@@ -172,10 +201,38 @@ async function useSupabaseAuthState(sessionId = 'sildemar-bot') {
 }
 
 // ============================================================
+// 🔥 UTILIDADES DE TEXTO
+// ============================================================
+
+// Limpia el texto dejando solo letras, números y vocales acentuadas
+function limpiarTexto(texto) {
+    return String(texto || '')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')  // quitar símbolos y emojis
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// Quita acentos para comparaciones
+function sinAcentos(texto) {
+    return String(texto || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
+}
+
+// 🔥 Detecta si un mensaje NO tiene contenido útil (solo emojis, thumbs up, etc)
+function esMensajeVacio(texto) {
+    const limpio = limpiarTexto(texto);
+    // Si después de quitar símbolos/emojis queda menos de 2 caracteres → ignorar
+    if (limpio.length < 2) return true;
+    return false;
+}
+
+// ============================================================
 // DETECCIÓN DE INTENCIONES
 // ============================================================
 function detectarIntencion(texto) {
-    const t = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const t = sinAcentos(texto);
 
     const palabrasUbicacion = ['ubicacion', 'donde', 'direccion', 'mapa', 'local', 'llegar', 'lugar', 'tienda', 'sucursal', 'como llego', 'donde quedan', 'donde estan'];
     if (palabrasUbicacion.some(p => t.includes(p))) return 'ubicacion';
@@ -192,10 +249,10 @@ function detectarIntencion(texto) {
 }
 
 // ============================================================
-// DETECCIÓN DE SELECCIÓN (para contexto)
+// DETECCIÓN DE SELECCIÓN
 // ============================================================
 function detectarSeleccion(texto) {
-    const t = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+    const t = sinAcentos(texto).trim();
 
     // Número puro o con prefijo: "1", "el 2", "opción 3"
     const matchNum = t.match(/^(?:el|la|opcion|numero)?\s*(\d+)\s*$/);
@@ -215,8 +272,8 @@ function detectarSeleccion(texto) {
     const matchEl = t.match(/^(?:quiero\s+)?(?:el|la)\s+(.+)/);
     if (matchEl) return { tipo: 'marca', texto: matchEl[1] };
 
-    // "ese", "esa", "quiero ese", "separa", "anotalo"
-    if (/^(ese|esa|esos|esas|sí|si|quiero|separalo|separame|anotalo|ese mismo|ese mismo|si por favor)\s*$/.test(t)) {
+    // "ese", "esa", "quiero ese", etc.
+    if (/^(ese|esa|esos|esas|si|quiero|separalo|separame|anotalo|ese mismo|si por favor)\s*$/.test(t)) {
         return { tipo: 'primero' };
     }
 
@@ -224,7 +281,7 @@ function detectarSeleccion(texto) {
 }
 
 // ============================================================
-// RESOLVER SELECCIÓN DENTRO DE LA LISTA GUARDADA
+// RESOLVER SELECCIÓN
 // ============================================================
 function resolverSeleccion(sesion, seleccion) {
     const productos = sesion.productos;
@@ -325,9 +382,8 @@ function esMensajePropioDelNegocio(texto) {
 // BUSCAR PRODUCTOS
 // ============================================================
 async function buscarProductos(mensajeCliente) {
-    if (!pool) return [];
     try {
-        const limpio = mensajeCliente.replace(/[^\w\sáéíóúñÁÉÍÓÚÑ]/gi, ' ').replace(/\s+/g, ' ').trim();
+        const limpio = limpiarTexto(mensajeCliente);
         if (!limpio || limpio.length < 3) return [];
 
         const stopWords = ['DE','LA','EL','LOS','LAS','UN','UNA','PARA','POR','CON','QUE','DEL','Y','O','AL','SE','SU','MI','TU','BUSCO','NECESITO','TIENEN','TENGO','QUIERO'];
@@ -336,7 +392,7 @@ async function buscarProductos(mensajeCliente) {
 
         const booleanQuery = palabras.map(p => `+${p}*`).join(' ');
 
-        const [booleanResults] = await pool.query(
+        const booleanResults = await querySegura(
             `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
                     modelo_vehiculo, precio, stock_actual,
                     MATCH(nombre_producto, marca_carro, marca_repuesto, modelo_vehiculo)
@@ -350,14 +406,14 @@ async function buscarProductos(mensajeCliente) {
             [booleanQuery, booleanQuery]
         );
 
-        if (booleanResults.length > 0) return booleanResults;
+        if (booleanResults && booleanResults.length > 0) return booleanResults;
 
         const conditions = palabras.map(() =>
             `(nombre_producto LIKE ? OR marca_carro LIKE ? OR marca_repuesto LIKE ? OR modelo_vehiculo LIKE ?)`
         ).join(' AND ');
         const params = palabras.flatMap(p => [`%${p}%`, `%${p}%`, `%${p}%`, `%${p}%`]);
 
-        const [likeResults] = await pool.query(
+        const likeResults = await querySegura(
             `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
                     modelo_vehiculo, precio, stock_actual
              FROM producto
@@ -366,7 +422,7 @@ async function buscarProductos(mensajeCliente) {
             params
         );
 
-        return likeResults;
+        return likeResults || [];
     } catch (err) {
         console.error('Error buscando productos:', err.message);
         return [];
@@ -377,9 +433,8 @@ async function buscarProductos(mensajeCliente) {
 // TASA DEL DÍA
 // ============================================================
 async function obtenerTasa() {
-    if (!pool) return 1;
     try {
-        const [rows] = await pool.query('SELECT tasa_dolar FROM configuracion WHERE id = 1');
+        const rows = await querySegura('SELECT tasa_dolar FROM configuracion WHERE id = 1');
         return parseFloat(rows[0]?.tasa_dolar) || 1;
     } catch {
         return 1;
@@ -476,6 +531,12 @@ async function iniciarBot() {
 
         if (!texto) return;
 
+        // 🔥 FILTRO NUEVO: Ignorar mensajes vacíos (solo emojis, 👍, 😊, etc.)
+        if (esMensajeVacio(texto)) {
+            console.log(`⏭️  Ignorado (sin texto útil): "${texto}"`);
+            return;
+        }
+
         if (esListaDePrecios(texto)) {
             console.log(`⏭️  Ignorado (lista de precios)`);
             return;
@@ -491,7 +552,7 @@ async function iniciarBot() {
         try { await sock.sendPresenceUpdate('composing', remitente); } catch {}
 
         // ============================================================
-        // 🔥 PRIMERO: Verificar si es selección de la lista anterior
+        // Verificar si es selección de la lista anterior
         // ============================================================
         const sesion = obtenerSesion(remitente);
         if (sesion) {
@@ -510,7 +571,7 @@ async function iniciarBot() {
         }
 
         // ============================================================
-        // Si NO es selección, procesar como mensaje normal
+        // Detectar intención
         // ============================================================
         const intencion = detectarIntencion(texto);
         let respuesta;
@@ -533,7 +594,6 @@ async function iniciarBot() {
                 const tasa = await obtenerTasa();
                 respuesta = formatearProductos(productos, tasa);
 
-                // 🔥 Guardar contexto si encontró productos
                 if (productos.length > 0) {
                     guardarSesion(remitente, productos);
                 }
