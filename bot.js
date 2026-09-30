@@ -19,6 +19,30 @@ const CONFIG = {
 };
 
 // ============================================================
+// MEMORIA DE CONVERSACIÓN POR USUARIO
+// ============================================================
+const userSessions = new Map();
+const SESSION_TTL = 30 * 60 * 1000; // 30 minutos
+
+function guardarSesion(jid, productos) {
+    userSessions.set(jid, { productos, timestamp: Date.now() });
+}
+
+function obtenerSesion(jid) {
+    const s = userSessions.get(jid);
+    if (!s) return null;
+    if (Date.now() - s.timestamp > SESSION_TTL) {
+        userSessions.delete(jid);
+        return null;
+    }
+    return s;
+}
+
+function limpiarSesion(jid) {
+    userSessions.delete(jid);
+}
+
+// ============================================================
 // SERVIDOR HTTP (KEEP-ALIVE PARA RENDER)
 // ============================================================
 const app = express();
@@ -71,7 +95,6 @@ async function useSupabaseAuthState(sessionId = 'sildemar-bot') {
         max: 3
     });
 
-    // Crear tabla si no existe
     await pgPool.query(`
         CREATE TABLE IF NOT EXISTS baileys_auth (
             session_id TEXT NOT NULL,
@@ -169,6 +192,64 @@ function detectarIntencion(texto) {
 }
 
 // ============================================================
+// DETECCIÓN DE SELECCIÓN (para contexto)
+// ============================================================
+function detectarSeleccion(texto) {
+    const t = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+
+    // Número puro o con prefijo: "1", "el 2", "opción 3"
+    const matchNum = t.match(/^(?:el|la|opcion|numero)?\s*(\d+)\s*$/);
+    if (matchNum) return { tipo: 'numero', valor: parseInt(matchNum[1]) };
+
+    // Ordinales
+    const ordinales = { 'primero': 1, 'segundo': 2, 'tercero': 3, 'cuarto': 4, 'quinto': 5 };
+    for (const [palabra, num] of Object.entries(ordinales)) {
+        if (t.includes(palabra)) return { tipo: 'numero', valor: num };
+    }
+
+    // "quiero el de vega", "el de bosch"
+    const matchDe = t.match(/(?:el|la)\s+de\s+(.+)/);
+    if (matchDe) return { tipo: 'marca', texto: matchDe[1] };
+
+    // "quiero el vega"
+    const matchEl = t.match(/^(?:quiero\s+)?(?:el|la)\s+(.+)/);
+    if (matchEl) return { tipo: 'marca', texto: matchEl[1] };
+
+    // "ese", "esa", "quiero ese", "separa", "anotalo"
+    if (/^(ese|esa|esos|esas|sí|si|quiero|separalo|separame|anotalo|ese mismo|ese mismo|si por favor)\s*$/.test(t)) {
+        return { tipo: 'primero' };
+    }
+
+    return null;
+}
+
+// ============================================================
+// RESOLVER SELECCIÓN DENTRO DE LA LISTA GUARDADA
+// ============================================================
+function resolverSeleccion(sesion, seleccion) {
+    const productos = sesion.productos;
+    if (!productos || productos.length === 0) return null;
+
+    if (seleccion.tipo === 'numero') {
+        return productos[seleccion.valor - 1] || null;
+    }
+
+    if (seleccion.tipo === 'primero') {
+        return productos[0];
+    }
+
+    if (seleccion.tipo === 'marca') {
+        const palabras = seleccion.texto.split(' ').filter(p => p.length >= 3);
+        for (const p of productos) {
+            const textoProd = `${p.nombre_producto} ${p.marca_repuesto || ''} ${p.marca_carro || ''} ${p.modelo_vehiculo || ''}`.toLowerCase();
+            if (palabras.some(pal => textoProd.includes(pal))) return p;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================
 // RESPUESTAS ESPECIALES
 // ============================================================
 function respuestaUbicacion() {
@@ -197,6 +278,23 @@ function respuestaHorario() {
            `Lunes a Viernes: 8:00 am - 5:00 pm\n` +
            `Sábados: 8:00 am - 1:00 pm\n\n` +
            `📍 Ubicación: ${CONFIG.ubicacion}`;
+}
+
+function respuestaSeleccion(producto, tasa) {
+    const precioBs = (parseFloat(producto.precio) * tasa).toFixed(2);
+    return `¡Perfecto! 🙌 Aquí está el detalle:\n\n` +
+           `*${producto.nombre_producto}*\n` +
+           `   Código: ${producto.codigo}\n` +
+           (producto.marca_carro ? `   Vehículo: ${producto.marca_carro} ${producto.modelo_vehiculo || ''}\n` : '') +
+           (producto.marca_repuesto ? `   Marca: ${producto.marca_repuesto}\n` : '') +
+           `   💵 $${parseFloat(producto.precio).toFixed(2)}\n` +
+           `   🇻🇪 Bs ${precioBs}\n` +
+           `   📦 Stock: ${producto.stock_actual}\n\n` +
+           `*¿Cómo lo separamos?* 🛒\n\n` +
+           `1️⃣ Pasa por el local y menciona el código *${producto.codigo}*\n` +
+           `2️⃣ O escríbenos aquí y coordinamos\n\n` +
+           `📍 *Estamos aquí:*\n${CONFIG.ubicacion}\n\n` +
+           `También puedes ver el catálogo completo:\n${CONFIG.catalogo}`;
 }
 
 // ============================================================
@@ -293,8 +391,7 @@ async function obtenerTasa() {
 // ============================================================
 function formatearProductos(productos, tasa) {
     if (productos.length === 0) {
-        return `Hmm, no encontré ese repuesto en el inventario 🤔\n\n` +
-               `Puede que esté con otro nombre, o quizás no lo tengamos cargado.\n\n` +
+        return `no encontré ese repuesto en el inventario 🤔\n\n` +
                `Te invito a revisar nuestro catálogo completo:\n\n` +
                `🛒 ${CONFIG.catalogo}\n\n` +
                `Si lo ves por ahí, escríbenos y lo separamos 😉`;
@@ -315,7 +412,7 @@ function formatearProductos(productos, tasa) {
     });
 
     texto += `_Los precios en Bs se calculan con la tasa del día._\n\n`;
-    texto += `¿Te interesa alguno? Escríbenos y lo separamos 😉\n\n`;
+    texto += `💡 _Responde con el número o el nombre del producto que te interese_\n\n`;
     texto += `🛒 Ver más productos: ${CONFIG.catalogo}`;
 
     return texto;
@@ -393,6 +490,28 @@ async function iniciarBot() {
 
         try { await sock.sendPresenceUpdate('composing', remitente); } catch {}
 
+        // ============================================================
+        // 🔥 PRIMERO: Verificar si es selección de la lista anterior
+        // ============================================================
+        const sesion = obtenerSesion(remitente);
+        if (sesion) {
+            const seleccion = detectarSeleccion(texto);
+            if (seleccion) {
+                const productoElegido = resolverSeleccion(sesion, seleccion);
+                if (productoElegido) {
+                    console.log(`🎯 [${pushName}] seleccionó: ${productoElegido.nombre_producto}`);
+                    const tasa = await obtenerTasa();
+                    const respuesta = respuestaSeleccion(productoElegido, tasa);
+                    await sock.sendMessage(remitente, { text: respuesta });
+                    limpiarSesion(remitente);
+                    return;
+                }
+            }
+        }
+
+        // ============================================================
+        // Si NO es selección, procesar como mensaje normal
+        // ============================================================
         const intencion = detectarIntencion(texto);
         let respuesta;
 
@@ -413,6 +532,11 @@ async function iniciarBot() {
                 const productos = await buscarProductos(texto);
                 const tasa = await obtenerTasa();
                 respuesta = formatearProductos(productos, tasa);
+
+                // 🔥 Guardar contexto si encontró productos
+                if (productos.length > 0) {
+                    guardarSesion(remitente, productos);
+                }
                 break;
             }
         }
