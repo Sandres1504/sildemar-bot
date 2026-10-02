@@ -7,6 +7,7 @@ const pino = require('pino');
 const mysql = require('mysql2/promise');
 const { Pool } = require('pg');
 const {
+    asegurarTablasWhatsApp,
     buscarClientePorTelefono,
     buscarNotificacionPorMensaje,
     crearNotificacion,
@@ -91,9 +92,7 @@ async function conectarBD() {
         'DB_USER',
         'DB_PASSWORD',
         'DB_NAME',
-        'DATABASE_URL',
-        'GERENTE_DELIVERY_PHONE',
-        'GERENTE_SHIPPING_PHONE'
+        'DATABASE_URL'
     ];
     const missing = required.filter((key) => !process.env[key]);
     if (missing.length > 0) {
@@ -121,6 +120,20 @@ async function conectarBD() {
         const conn = await pool.getConnection();
         console.log('✅ Conexión a MySQL (inventario) establecida');
         conn.release();
+
+        try {
+            await asegurarTablasWhatsApp(pool);
+            console.log('✅ Tablas de integración WhatsApp listas');
+        } catch (error) {
+            if (error.code === 'ER_TABLEACCESS_DENIED_ERROR' || error.errno === 1142) {
+                throw new Error(
+                    'El usuario MySQL no tiene permiso CREATE para preparar las tablas WhatsApp. ' +
+                    'Importa backend/sql/whatsapp_integration.sql con un usuario administrador.',
+                    { cause: error }
+                );
+            }
+            throw error;
+        }
 
         for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones']) {
             const [tables] = await pool.execute(

@@ -25,9 +25,18 @@ function normalizarNumeroWhatsApp(telefono) {
     return digitos;
 }
 
+const TELEFONOS_GERENCIA_PREDETERMINADOS = {
+    delivery: '04142149796',
+    envio: '04142522920'
+};
+
 function obtenerContactosGerencia(environment = process.env) {
-    const delivery = normalizarNumeroWhatsApp(environment.GERENTE_DELIVERY_PHONE || '');
-    const envio = normalizarNumeroWhatsApp(environment.GERENTE_SHIPPING_PHONE || '');
+    const delivery = normalizarNumeroWhatsApp(
+        environment.GERENTE_DELIVERY_PHONE || TELEFONOS_GERENCIA_PREDETERMINADOS.delivery
+    );
+    const envio = normalizarNumeroWhatsApp(
+        environment.GERENTE_SHIPPING_PHONE || TELEFONOS_GERENCIA_PREDETERMINADOS.envio
+    );
     return {
         delivery: { tipo: 'delivery', telefono: delivery, jid: `${delivery}@s.whatsapp.net` },
         envio: { tipo: 'envio', telefono: envio, jid: `${envio}@s.whatsapp.net` }
@@ -39,6 +48,43 @@ function obtenerContactosParaNotificacion(tipo, environment = process.env) {
     if (tipo === 'pedido') return [contactos.delivery];
     if (tipo === 'envio') return [contactos.envio];
     return [contactos.delivery, contactos.envio];
+}
+
+async function asegurarTablasWhatsApp(pool) {
+    await pool.execute(`
+        CREATE TABLE IF NOT EXISTS whatsapp_solicitudes (
+            id_solicitud BIGINT NOT NULL PRIMARY KEY,
+            origen VARCHAR(32) NOT NULL DEFAULT 'whatsapp',
+            telefono_cliente VARCHAR(32) NOT NULL,
+            metodo_entrega VARCHAR(40) NOT NULL,
+            datos_entrega LONGTEXT NOT NULL,
+            creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY idx_whatsapp_solicitudes_creado (creado_en),
+            KEY idx_whatsapp_solicitudes_origen (origen)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    await pool.execute(`
+        CREATE TABLE IF NOT EXISTS whatsapp_notificaciones (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            referencia VARCHAR(40) NOT NULL,
+            tipo VARCHAR(20) NOT NULL,
+            id_solicitud BIGINT NULL,
+            client_jid VARCHAR(191) NOT NULL,
+            client_name VARCHAR(191) NOT NULL,
+            client_phone VARCHAR(32) NOT NULL,
+            detalle LONGTEXT NOT NULL,
+            manager_message_id VARCHAR(191) NULL,
+            estado VARCHAR(20) NOT NULL DEFAULT 'pendiente',
+            respuesta_gerencia LONGTEXT NULL,
+            detalle_error VARCHAR(1000) NULL,
+            creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            respondida_en DATETIME NULL,
+            UNIQUE KEY uq_whatsapp_notificaciones_referencia (referencia),
+            UNIQUE KEY uq_whatsapp_notificaciones_manager_message (manager_message_id),
+            KEY idx_whatsapp_notificaciones_estado (estado),
+            KEY idx_whatsapp_notificaciones_solicitud (id_solicitud)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
 }
 
 async function buscarPersonaCliente(conn, telefono, cedula = null, lock = false) {
@@ -336,6 +382,7 @@ async function registrarRespuestaGerencia(pool, idNotificacion, respuesta) {
 }
 
 module.exports = {
+    asegurarTablasWhatsApp,
     buscarClientePorTelefono,
     buscarNotificacionPorMensaje,
     crearNotificacion,

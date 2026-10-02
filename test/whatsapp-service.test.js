@@ -1,11 +1,25 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+    asegurarTablasWhatsApp,
     crearPedidoWhatsApp,
     obtenerContactosGerencia,
     obtenerContactosParaNotificacion,
     normalizarNumeroWhatsApp
 } = require('../whatsapp-service');
+
+test('crea las tablas auxiliares de WhatsApp si aún no existen', async () => {
+    const statements = [];
+    await asegurarTablasWhatsApp({
+        async execute(sql) {
+            statements.push(sql);
+        }
+    });
+
+    assert.equal(statements.length, 2);
+    assert.match(statements[0], /CREATE TABLE IF NOT EXISTS whatsapp_solicitudes/);
+    assert.match(statements[1], /CREATE TABLE IF NOT EXISTS whatsapp_notificaciones/);
+});
 
 test('normaliza los contactos locales a JID de WhatsApp con código de país', () => {
     const contactos = obtenerContactosGerencia({
@@ -41,10 +55,17 @@ test('normaliza los contactos locales a JID de WhatsApp con código de país', (
     );
 });
 
-test('rechaza un contacto de gerencia ausente o inválido', () => {
+test('usa los contactos predeterminados cuando faltan variables de entorno', () => {
+    const contactos = obtenerContactosGerencia({});
+    assert.match(contactos.delivery.jid, /^584142149796@s\.whatsapp\.net$/);
+    assert.match(contactos.envio.jid, /^584142522920@s\.whatsapp\.net$/);
+});
+
+test('rechaza un contacto de gerencia inválido', () => {
     assert.throws(() => normalizarNumeroWhatsApp(''), /no es válido/);
     assert.throws(() => obtenerContactosGerencia({
-        GERENTE_DELIVERY_PHONE: '04142149796'
+        GERENTE_DELIVERY_PHONE: '1',
+        GERENTE_SHIPPING_PHONE: '04142522920'
     }), /no es válido/);
 });
 
