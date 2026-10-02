@@ -360,15 +360,29 @@ async function marcarNotificacionFallida(pool, idNotificacion, errorMessage) {
     );
 }
 
-async function buscarNotificacionPorMensaje(pool, messageId) {
+async function buscarNotificacionPorMensaje(pool, messageId, tipoGerencia) {
+    const sufijo = tipoGerencia === 'delivery' ? 'D' : 'E';
     const [rows] = await pool.execute(
         `SELECT id, client_jid, client_name, estado
          FROM whatsapp_notificaciones
-         WHERE manager_message_id = ?
+         WHERE manager_message_id = ? AND referencia LIKE ?
          LIMIT 1`,
-        [messageId]
+        [messageId, `%-${sufijo}`]
     );
     return rows[0] || null;
+}
+
+async function buscarNotificacionesPendientesGerencia(pool, tipoGerencia) {
+    const sufijo = tipoGerencia === 'delivery' ? 'D' : 'E';
+    const [rows] = await pool.execute(
+        `SELECT id, client_jid, client_name, estado
+         FROM whatsapp_notificaciones
+         WHERE estado = 'enviada' AND referencia LIKE ?
+         ORDER BY creado_en DESC
+         LIMIT 2`,
+        [`%-${sufijo}`]
+    );
+    return rows;
 }
 
 async function registrarRespuestaGerencia(pool, idNotificacion, respuesta) {
@@ -385,6 +399,7 @@ module.exports = {
     asegurarTablasWhatsApp,
     buscarClientePorTelefono,
     buscarNotificacionPorMensaje,
+    buscarNotificacionesPendientesGerencia,
     crearNotificacion,
     crearPedidoWhatsApp,
     obtenerContactosGerencia,

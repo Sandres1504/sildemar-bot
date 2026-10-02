@@ -10,6 +10,7 @@ const {
     asegurarTablasWhatsApp,
     buscarClientePorTelefono,
     buscarNotificacionPorMensaje,
+    buscarNotificacionesPendientesGerencia,
     crearNotificacion,
     crearPedidoWhatsApp,
     marcarNotificacionFallida,
@@ -535,6 +536,31 @@ function extraerTexto(mensaje) {
         '';
 }
 
+function desenvolverMensaje(mensaje) {
+    let contenido = mensaje;
+    const envolturas = [
+        'ephemeralMessage',
+        'viewOnceMessage',
+        'viewOnceMessageV2',
+        'documentWithCaptionMessage',
+        'editedMessage'
+    ];
+    while (contenido) {
+        const envoltura = envolturas.find((tipo) => contenido[tipo]?.message);
+        if (!envoltura) break;
+        contenido = contenido[envoltura].message;
+    }
+    return contenido || {};
+}
+
+function obtenerIdMensajeCitado(mensaje) {
+    const contextInfo = mensaje.extendedTextMessage?.contextInfo ||
+        mensaje.imageMessage?.contextInfo ||
+        mensaje.videoMessage?.contextInfo ||
+        mensaje.documentMessage?.contextInfo;
+    return contextInfo?.stanzaId || null;
+}
+
 function extraerUbicacion(mensaje) {
     const ubicacion = mensaje.locationMessage || mensaje.liveLocationMessage;
     if (!ubicacion || !Number.isFinite(ubicacion.degreesLatitude) ||
@@ -557,20 +583,23 @@ function obtenerTelefonoJid(jid) {
     return digitos || null;
 }
 
-function esJidGerencia(jid, jidAlternativo) {
+function identificarGerencia(jid, jidAlternativo) {
     const contactos = obtenerContactosGerencia();
-    const telefonos = new Set([
-        contactos.delivery.telefono,
-        contactos.envio.telefono
-    ]);
-    return [jid, jidAlternativo].some((valor) => {
-        if (!valor) return false;
+    for (const valor of [jid, jidAlternativo]) {
+        if (!valor) continue;
         try {
-            return telefonos.has(normalizarNumeroWhatsApp(obtenerTelefonoJid(valor)));
+            const telefono = normalizarNumeroWhatsApp(obtenerTelefonoJid(valor));
+            const contacto = Object.values(contactos).find((item) => item.telefono === telefono);
+            if (contacto) return contacto.tipo;
         } catch (error) {
-            return false;
+            continue;
         }
-    });
+    }
+    return null;
+}
+
+function esJidGerencia(jid, jidAlternativo) {
+    return Boolean(identificarGerencia(jid, jidAlternativo));
 }
 
 function crearWaMe(telefono) {
@@ -977,24 +1006,67 @@ async function procesarMensaje(sock, msg) {
     const jid = msg.key.remoteJid;
     if (!jid || esMensajeDeGrupo(jid)) return;
 
-    const texto = extraerTexto(msg.message);
+    const mensaje = desenvolverMensaje(msg.message);
+    const texto = extraerTexto(mensaje);
     const ubicacion = extraerUbicacion(msg.message);
     const jidAlternativo = msg.key.remoteJidAlt;
 
-    if (esJidGerencia(jid, jidAlternativo)) {
-        const stanzaId = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
-        if (!stanzaId || !texto.trim()) return;
+    const tipoGerencia = identificarGerencia(jid, jidAlternativo);
+    if (tipoGerencia) {
+        if (!texto.trim()) return;
 
-        const notificacion = await buscarNotificacionPorMensaje(pool, stanzaId);
-        if (!notificacion || notificacion.estado !== 'enviada') return;
+        let respuestaEntregada = false;
+        try {
+            const stanzaId = obtenerIdMensajeCitado(mensaje);
+            let notificacion;
+            if (stanzaId) {
+                notificacion = await buscarNotificacionPorMensaje(pool, stanzaId, tipoGerencia);
+                if (!notificacion) {
+                    await sock.sendMessage(jid, {
+                        text: 'No pude identificar la notificación citada. Responde directamente al mensaje original enviado por el bot.'
+                    });
+                    return;
+                }
+            } else {
+                const pendientes = await buscarNotificacionesPendientesGerencia(pool, tipoGerencia);
+                if (pendientes.length !== 1) {
+                    await sock.sendMessage(jid, {
+                        text: pendientes.length > 1
+                            ? 'Hay varias consultas pendientes. Para evitar enviar tu respuesta al cliente equivocado, usa *Responder* sobre la notificación correspondiente.'
+                            : 'No encontré una consulta pendiente para este número. Responde usando *Responder* sobre la notificación original del bot.'
+                    });
+                    return;
+                }
+                [notificacion] = pendientes;
+            }
 
-        await sock.sendMessage(notificacion.client_jid, {
-            text: `💬 Respuesta de gerencia:\n\n${texto.trim()}`
-        });
-        const respuestaRegistrada = await registrarRespuestaGerencia(pool, notificacion.id, texto.trim());
-        if (respuestaRegistrada) {
+            if (notificacion.estado !== 'enviada') {
+                await sock.sendMessage(jid, {
+                    text: 'Esta notificación ya fue respondida anteriormente.'
+                });
+                return;
+            }
+
+            await sock.sendMessage(notificacion.client_jid, {
+                text: `💬 Respuesta de gerencia:\n\n${texto.trim()}`
+            });
+            respuestaEntregada = true;
+            const respuestaRegistrada = await registrarRespuestaGerencia(pool, notificacion.id, texto.trim());
+            if (respuestaRegistrada) {
+                await sock.sendMessage(jid, {
+                    text: `🙏 ¡Muchas gracias por la atención! ✅ Tu respuesta fue enviada al cliente ${notificacion.client_name}.`
+                });
+            } else {
+                await sock.sendMessage(jid, {
+                    text: 'El mensaje llegó al cliente, pero no pude actualizar el estado de la notificación. Revisa los registros del bot.'
+                });
+            }
+        } catch (error) {
+            console.error('Error reenviando la respuesta de gerencia al cliente:', error);
             await sock.sendMessage(jid, {
-                text: `✅ Respuesta enviada con éxito al cliente ${notificacion.client_name}`
+                text: respuestaEntregada
+                    ? 'El mensaje llegó al cliente, pero ocurrió un problema al actualizar la notificación. El bot registró el error.'
+                    : 'No pude reenviar tu respuesta al cliente en este momento. El bot registró el error; intenta nuevamente más tarde.'
             });
         }
         return;

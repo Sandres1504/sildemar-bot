@@ -2,6 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     asegurarTablasWhatsApp,
+    buscarNotificacionPorMensaje,
+    buscarNotificacionesPendientesGerencia,
     crearPedidoWhatsApp,
     obtenerContactosGerencia,
     obtenerContactosParaNotificacion,
@@ -67,6 +69,42 @@ test('rechaza un contacto de gerencia inválido', () => {
         GERENTE_DELIVERY_PHONE: '1',
         GERENTE_SHIPPING_PHONE: '04142522920'
     }), /no es válido/);
+});
+
+test('busca una respuesta citada solo entre las notificaciones de ese gerente', async () => {
+    let consulta;
+    let parametros;
+    const resultadoEsperado = { id: 3, estado: 'enviada' };
+    const pool = {
+        async execute(sql, valores) {
+            consulta = sql;
+            parametros = valores;
+            return [[resultadoEsperado]];
+        }
+    };
+
+    const resultado = await buscarNotificacionPorMensaje(pool, 'mensaje-123', 'envio');
+
+    assert.equal(resultado, resultadoEsperado);
+    assert.match(consulta, /manager_message_id = \? AND referencia LIKE \?/);
+    assert.deepEqual(parametros, ['mensaje-123', '%-E']);
+});
+
+test('solo usa una respuesta sin cita cuando el gerente tiene una notificación pendiente', async () => {
+    let parametros;
+    const pool = {
+        async execute(sql, valores) {
+            assert.match(sql, /estado = 'enviada'/);
+            assert.match(sql, /ORDER BY creado_en DESC\s+LIMIT 2/);
+            parametros = valores;
+            return [[{ id: 1 }]];
+        }
+    };
+
+    const pendientes = await buscarNotificacionesPendientesGerencia(pool, 'delivery');
+
+    assert.deepEqual(pendientes, [{ id: 1 }]);
+    assert.deepEqual(parametros, ['%-D']);
 });
 
 function crearPoolSimulado(stock = 10, fallaReserva = false) {

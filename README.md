@@ -55,8 +55,10 @@ despacho dentro de la misma transacción. La ficha local se envía al contacto
 Las consultas sin producto disponible se registran y se remiten a ventas con una
 referencia y se envían a ambos contactos. El número local con prefijo 0 se
 normaliza a código internacional de Venezuela al generar el JID de WhatsApp.
-Gerencia puede responder citando el mensaje original de la notificación; el bot
-reenvía la respuesta al cliente y confirma el envío.
+Gerencia puede responder citando la notificación original. También puede enviar
+una respuesta normal si tiene una sola notificación pendiente; si hay varias,
+el bot pedirá citar la notificación para no enviar el texto al cliente equivocado.
+Después de reenviarla, el bot confirma el envío y agradece al gerente.
 
 Usa [`.env.example`](./.env.example) como referencia para las variables locales
 y configura otros números en Render solo si necesitas cambiar los contactos.
