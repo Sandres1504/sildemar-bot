@@ -571,8 +571,11 @@ function prepararConsultaProducto(texto) {
         'VENDEN', 'ALGUN', 'ALGUNA', 'ALGUNO', 'QUISIERA', 'SABER'
     ]);
     const limpio = limpiarTexto(texto).toUpperCase();
-    // Normalizar tokens como "110DITES", "110DIENTES" → "110 DIENTES"
-    const normalizado = limpio.replace(/(\d+)([A-Z])/g, '$1 $2').replace(/([A-Z])(\d+)/g, '$1 $2');
+    // Solo separar dígitos de letras cuando la parte alfabética es >= 3 caracteres
+    // (es una palabra real como "DIENTES", no parte de un código como "A346Y522MM")
+    const normalizado = limpio
+        .replace(/(\d+)([A-Z]{3,})/g, '$1 $2')   // 110DIENTES → "110 DIENTES"
+        .replace(/([A-Z]{3,})(\d+)/g, '$1 $2');   // CORSA2008 → "CORSA 2008"
     const palabras = normalizado.split(' ').filter(p => p.length >= 2 && !stopWords.has(p));
     return palabras;
 }
@@ -739,10 +742,66 @@ function esMensajePropioDelNegocio(texto) {
 // ============================================================
 // BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA
 // ============================================================
+// Detecta si el texto parece un código de producto (alfanumérico compacto, sin espacios)
+function esCodigoProducto(texto) {
+    const limpio = texto.trim().replace(/\s+/g, '');
+    // Código: 4-25 caracteres alfanuméricos, con al menos una letra Y al menos un dígito
+    return /^[A-Z0-9]{4,25}$/i.test(limpio) && /[A-Za-z]/.test(limpio) && /\d/.test(limpio);
+}
+
+// Búsqueda directa por código de producto (sin dividir en palabras)
+async function buscarPorCodigo(texto) {
+    const codigo = texto.trim().replace(/\s+/g, '').toUpperCase();
+    if (codigo.length < 3) return [];
+    try {
+        const rows = await querySegura(
+            `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
+                    modelo_vehiculo, precio, stock_actual
+             FROM producto
+             WHERE codigo LIKE ? AND stock_actual > 0
+             LIMIT 5`,
+            [`%${codigo}%`]
+        );
+        return rows || [];
+    } catch (error) {
+        console.error('Error buscando por código:', error.message);
+        return [];
+    }
+}
+
 async function buscarProductos(mensajeCliente, detalleConsulta = null) {
     try {
+        // --- Prioridad 1: búsqueda directa por código ---
+        // Si el mensaje original (o el producto extraído por Gemini) parece un código,
+        // buscar primero en la columna `codigo` con el token completo sin dividir.
+        const candidatosCodigo = [];
+        const textosCodigo = [
+            mensajeCliente,
+            detalleConsulta?.producto || ''
+        ];
+        for (const t of textosCodigo) {
+            const limpio = t.trim().replace(/\s+/g, '');
+            if (esCodigoProducto(limpio)) {
+                const resultados = await buscarPorCodigo(limpio);
+                if (resultados.length > 0) return resultados.slice(0, 5);
+            }
+            // También revisar si alguna palabra individual del texto es un código
+            for (const token of t.trim().split(/\s+/)) {
+                if (esCodigoProducto(token)) {
+                    const resultados = await buscarPorCodigo(token);
+                    if (resultados.length > 0 && !candidatosCodigo.length) {
+                        candidatosCodigo.push(...resultados);
+                    }
+                }
+            }
+        }
+
+        // --- Prioridad 2: búsqueda por palabras clave ---
         const palabras = prepararConsultaProducto(mensajeCliente);
-        if (palabras.length === 0) return [];
+        if (palabras.length === 0) {
+            // Si no hay palabras clave pero sí hay candidatos por código, usarlos
+            return candidatosCodigo.slice(0, 5);
+        }
 
         // Solo excluir años reales del campo vehículo (4 dígitos 1900-2099)
         // Conservar specs numéricas del producto como "110", "92", etc.
@@ -757,7 +816,7 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
                 .filter(palabra => !vehiculoFiltrado.includes(palabra) && !esAnioVehiculo(palabra))
             : palabras.filter(palabra => !esAnioVehiculo(palabra));
 
-        if (palabrasRepuesto.length === 0) return [];
+        if (palabrasRepuesto.length === 0) return candidatosCodigo.slice(0, 5);
 
         const condicionesRepuesto = palabrasRepuesto.map(() =>
             detalleConsulta
@@ -787,7 +846,7 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
             [...paramsRepuesto, ...paramsVehiculo]
         );
 
-        if (!candidatos || candidatos.length === 0) return [];
+        if (!candidatos || candidatos.length === 0) return candidatosCodigo.slice(0, 5);
 
         const relevantes = detalleConsulta
             ? filtrarProductosPorConsulta(candidatos, detalleConsulta.producto, detalleConsulta.vehiculo)
