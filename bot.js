@@ -61,7 +61,7 @@ const genAI = process.env.GEMINI_API_KEY
     ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
     : null;
 const model = genAI?.getGenerativeModel({
-    model: 'gemini-3.5-flash',
+    model: 'gemini-3.5-flash-lite',
     systemInstruction: SYSTEM_PROMPT_GEMINI,
     generationConfig: {
         temperature: 0.2,
