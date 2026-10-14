@@ -115,6 +115,7 @@ class GeminiService {
             throw error;
         }
 
+        // Limpiar historiales expirados
         for (const [cliente, historial] of this.historiales) {
             if (Date.now() - historial.timestamp > this.ttl) {
                 this.historiales.delete(cliente);
@@ -124,27 +125,51 @@ class GeminiService {
         this.guardarMensaje(jid, 'user', mensajeCliente);
         const historial = [...this.obtenerHistorial(jid)];
         if (historial[0]?.role === 'model') historial.shift();
-        const resultado = await this.model.generateContent({ contents: historial });
-        const texto = resultado.response.text().trim().replace(/^```(?:json)?\s*|\s*```$/g, '');
 
-        let respuesta;
-        try {
-            respuesta = JSON.parse(texto);
-        } catch {
-            throw new Error('Gemini devolvió una respuesta JSON inválida');
+        // 🔥 Reintentos con backoff para errores temporales (503, 500, 429)
+        const maxIntentos = 3;
+        const delaysMs = [800, 2000, 4000];
+        let ultimoError = null;
+
+        for (let intento = 0; intento < maxIntentos; intento++) {
+            try {
+                const resultado = await this.model.generateContent({ contents: historial });
+                const texto = resultado.response.text().trim().replace(/^```(?:json)?\s*|\s*```$/g, '');
+
+                let respuesta;
+                try {
+                    respuesta = JSON.parse(texto);
+                } catch {
+                    throw new Error('Gemini devolvió una respuesta JSON inválida');
+                }
+
+                if (!respuesta || !ACCIONES_GEMINI.includes(respuesta.accion)
+                    || typeof respuesta.respuesta_texto !== 'string') {
+                    throw new Error('Gemini devolvió una respuesta con formato inválido');
+                }
+
+                return {
+                    accion: respuesta.accion,
+                    respuesta_texto: respuesta.respuesta_texto.slice(0, 1500),
+                    producto: typeof respuesta.producto === 'string' ? respuesta.producto.slice(0, 200) : '',
+                    vehiculo: typeof respuesta.vehiculo === 'string' ? respuesta.vehiculo.slice(0, 200) : ''
+                };
+            } catch (error) {
+                ultimoError = error;
+                const status = Number(error?.status || error?.statusCode || error?.response?.status);
+                const esTemporal = status === 503 || status === 500 || status === 429
+                    || /Service Unavailable|high demand|RESOURCE_EXHAUSTED|overloaded|temporarily/i.test(String(error?.message || ''));
+
+                if (!esTemporal || intento === maxIntentos - 1) {
+                    throw error;
+                }
+
+                console.log(`⏳ Gemini saturado (intento ${intento + 1}/${maxIntentos}), reintentando en ${delaysMs[intento]}ms...`);
+                await new Promise(r => setTimeout(r, delaysMs[intento]));
+            }
         }
 
-        if (!respuesta || !ACCIONES_GEMINI.includes(respuesta.accion)
-            || typeof respuesta.respuesta_texto !== 'string') {
-            throw new Error('Gemini devolvió una respuesta con formato inválido');
-        }
-
-        return {
-            accion: respuesta.accion,
-            respuesta_texto: respuesta.respuesta_texto.slice(0, 1500),
-            producto: typeof respuesta.producto === 'string' ? respuesta.producto.slice(0, 200) : '',
-            vehiculo: typeof respuesta.vehiculo === 'string' ? respuesta.vehiculo.slice(0, 200) : ''
-        };
+        throw ultimoError;
     }
 }
 
@@ -420,7 +445,6 @@ function sinAcentos(texto) {
 // 🔥 Detecta si un mensaje NO tiene contenido útil (solo emojis, thumbs up, etc)
 function esMensajeVacio(texto) {
     const limpio = limpiarTexto(texto);
-    // Si después de quitar símbolos/emojis queda menos de 2 caracteres → ignorar
     if (limpio.length < 2) return true;
     return false;
 }
@@ -436,19 +460,23 @@ function normalizarFrase(texto) {
 function detectarIntencion(texto) {
     const t = normalizarFrase(texto);
 
-    if (/^(?:hola|hey|saludos|buenas?|buenos dias?|buenas tardes|buenas noches|que tal)(?: (?:hola|hey|saludos|buenas?|buenos dias?|buenas tardes|buenas noches|que tal))*$/.test(t)) {
+    // 🔥 Saludos (incluye singular "buen día" y plural "buenos días")
+    if (/^(?:hola+|hey+|saludos|buenas?|buenos?\s+dias?|buen\s+dia|buenas?\s+tardes|buenas?\s+noches|que\s+tal)(?:[\s,]+(?:hola+|hey+|saludos|buenas?|buenos?\s+dias?|buen\s+dia|buenas?\s+tardes|buenas?\s+noches|que\s+tal))*$/i.test(t.trim())) {
         return 'saludo';
     }
 
-    if (/^(?:(?:bueno|ok|muchas|mil|de verdad|te doy las) )*(?:gracias?|se agradece|te agradezco)(?: (?:por todo|mucho|mil))?$/.test(t)) {
+    // Agradecimientos
+    if (/^(?:(?:bueno|ok|muchas|mil|de verdad|te doy las)\s+)*(?:gracias?|se agradece|te agradezco)(?:\s+(?:por todo|mucho|mil))?$/.test(t)) {
         return 'gracias';
     }
 
-    if (/^(?:cual es la )?(?:ubicacion|direccion)(?: de ustedes)?$|^(?:donde queda|donde quedan|donde estan|como llego|como llegar|estan ubicados|me pasas la ubicacion|pasame la ubicacion|ubicacion por favor)$/.test(t)) {
+    // Ubicación
+    if (/^(?:cual es la\s+)?(?:ubicacion|direccion)(?:\s+de ustedes)?$|^(?:donde queda|donde quedan|donde estan|como llego|como llegar|estan ubicados|me pasas la ubicacion|pasame la ubicacion|ubicacion por favor)$/.test(t)) {
         return 'ubicacion';
     }
 
-    if (/^(?:cual es su )?horario$|^(?:a que hora abren|a que hora cierran|cuando abren|cuando cierran|estan abiertos?)$/.test(t)) {
+    // Horario
+    if (/^(?:cual es su\s+)?horario$|^(?:a que hora abren|a que hora cierran|cuando abren|cuando cierran|estan abiertos?)$/.test(t)) {
         return 'horario';
     }
 
@@ -497,11 +525,11 @@ function respuestaPedirProducto() {
 function detectarSeguimientoProducto(texto) {
     const t = normalizarFrase(texto);
 
-    if (/^(?:(?:y|el|la|me dices|me indica|por favor|porfa|cual es el) )*(?:precio|costo|cuanto(?: cuesta| vale)?|a como|en cuanto(?: esta| queda)?)(?: por favor| porfa)?$/.test(t)) {
+    if (/^(?:(?:y|el|la|me dices|me indica|por favor|porfa|cual es el)\s+)*(?:precio|costo|cuanto(?:\s+cuesta|\s+vale)?|a como|en cuanto(?:\s+esta|\s+queda)?)(?:\s+por favor|\s+porfa)?$/.test(t)) {
         return 'precio';
     }
 
-    if (/^(?:(?:y|esta|estara|tiene|tienen|hay|lo tienen|lo tienes|todavia hay|aun hay|me confirmas|me dices|por favor|porfa) )*(?:disponible|disponibilidad|existencia|stock|hay|tienen|lo tienen|lo tienes|tiene|queda|quedan|eso|ese|esa|esto)(?: (?:eso|ese|esa|esto|disponible|por favor|porfa))?$/.test(t)) {
+    if (/^(?:(?:y|esta|estara|tiene|tienen|hay|lo tienen|lo tienes|todavia hay|aun hay|me confirmas|me dices|por favor|porfa)\s+)*(?:disponible|disponibilidad|existencia|stock|hay|tienen|lo tienen|lo tienes|tiene|queda|quedan|eso|ese|esa|esto)(?:\s+(?:eso|ese|esa|esto|disponible|por favor|porfa))?$/.test(t)) {
         return 'disponibilidad';
     }
 
@@ -555,25 +583,20 @@ function prepararConsultaProducto(texto) {
 function detectarSeleccion(texto) {
     const t = sinAcentos(texto).trim();
 
-    // Número puro o con prefijo: "1", "el 2", "opción 3"
     const matchNum = t.match(/^(?:el|la|opcion|numero)?\s*(\d+)\s*$/);
     if (matchNum) return { tipo: 'numero', valor: parseInt(matchNum[1]) };
 
-    // Ordinales
     const ordinales = { 'primero': 1, 'segundo': 2, 'tercero': 3, 'cuarto': 4, 'quinto': 5 };
     for (const [palabra, num] of Object.entries(ordinales)) {
         if (t.includes(palabra)) return { tipo: 'numero', valor: num };
     }
 
-    // "quiero el de vega", "el de bosch"
     const matchDe = t.match(/(?:el|la)\s+de\s+(.+)/);
     if (matchDe) return { tipo: 'marca', texto: matchDe[1] };
 
-    // "quiero el vega"
     const matchEl = t.match(/^(?:quiero\s+)?(?:el|la)\s+(.+)/);
     if (matchEl) return { tipo: 'marca', texto: matchEl[1] };
 
-    // "ese", "esa", "quiero ese", etc.
     if (/^(ese|esa|esos|esas|si|quiero|separalo|separame|anotalo|ese mismo|si por favor)\s*$/.test(t)) {
         return { tipo: 'primero' };
     }
@@ -622,6 +645,9 @@ function respuestaErrorGemini(error) {
     const status = Number(error?.status || error?.statusCode || error?.response?.status);
     if (status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(String(error?.message || ''))) {
         return 'Disculpa, estamos recibiendo muchas consultas en este momento. Intenta escribirnos de nuevo en unos minutos 🙏';
+    }
+    if (status === 503 || /Service Unavailable|high demand/i.test(String(error?.message || ''))) {
+        return 'Disculpa, en este momento el asistente está un poco saturado. Intenta de nuevo en unos segundos 🙏';
     }
     return `Disculpa, tuve un problema para procesar tu mensaje. Intenta de nuevo en unos minutos o llámanos al ${CONFIG.telefono} 🙏`;
 }
@@ -1366,19 +1392,16 @@ async function procesarMensaje(sock, msg) {
     // FLUJO PRINCIPAL: Gemini primero, fallback a la lógica tradicional
     // ============================================================
 
-    // Intentar con Gemini (si está configurado)
     if (geminiService.model) {
         let decision;
         try {
             decision = await geminiService.generarRespuesta(texto, jid);
         } catch (error) {
-            // Si Gemini falla, no rompemos el flujo: caemos al fallback tradicional
             console.warn('Gemini falló, usando lógica tradicional:', error.message);
             decision = null;
         }
 
         if (decision) {
-            // Acciones que Gemini puede manejar directamente
             if (decision.accion === 'ubicacion') {
                 geminiService.guardarRespuesta(jid, decision.respuesta_texto);
                 await sock.sendMessage(jid, { text: decision.respuesta_texto || respuestaUbicacion() });
@@ -1415,7 +1438,6 @@ async function procesarMensaje(sock, msg) {
                     return;
                 }
             }
-            // conversacion_general u otra acción no listada: responder lo que dijo Gemini
             const respuesta = decision.respuesta_texto || respuestaPedirProducto();
             geminiService.guardarRespuesta(jid, respuesta);
             await sock.sendMessage(jid, { text: respuesta });
@@ -1450,6 +1472,14 @@ async function procesarMensaje(sock, msg) {
             await sock.sendMessage(jid, { text: respuestaHorario() });
             return;
         default: {
+            // 🔥 Si no hay palabras de producto válidas, pedir el repuesto en lugar de buscar/notificar
+            const palabrasProducto = prepararConsultaProducto(texto);
+            if (palabrasProducto.length === 0) {
+                const respuesta = respuestaPedirProducto();
+                await sock.sendMessage(jid, { text: respuesta });
+                return;
+            }
+
             const productos = await buscarProductos(texto);
             if (productos.length > 0) {
                 const tasa = await obtenerTasa();
