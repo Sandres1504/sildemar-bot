@@ -224,7 +224,7 @@ function iniciarServidor() {
 }
 
 // ============================================================
-// CONEXIÓN A MYSQL (INVENTARIO) - OPTIMIZADO PARA cPANEL
+// CONEXIÓN A MYSQL (INVENTARIO)
 // ============================================================
 let mysqlFallos = 0;
 const MYSQL_MAX_FALLOS = 5;
@@ -684,14 +684,14 @@ function esMensajePropioDelNegocio(texto) {
 }
 
 // ============================================================
-// BUSCAR PRODUCTOS
+// BUSCAR PRODUCTOS CON PUNTUACIÓN POR RELEVANCIA
 // ============================================================
 async function buscarProductos(mensajeCliente) {
     try {
         const palabras = prepararConsultaProducto(mensajeCliente);
         if (palabras.length === 0) return [];
 
-        // 1) Intentar búsqueda FULLTEXT (más precisa) si el índice existe
+        // 1) Intentar búsqueda FULLTEXT si el índice existe
         const booleanQuery = palabras.map(p => `+${p}*`).join(' ');
         let booleanResults = [];
         try {
@@ -705,31 +705,57 @@ async function buscarProductos(mensajeCliente) {
                        AGAINST(? IN BOOLEAN MODE)
                        AND stock_actual > 0
                  ORDER BY score DESC
-                 LIMIT 5`,
+                 LIMIT 10`,
                 [booleanQuery, booleanQuery]
             );
         } catch (error) {
             console.warn('FULLTEXT no disponible, usando LIKE:', error.message);
         }
 
-        if (booleanResults && booleanResults.length > 0) return booleanResults;
+        if (booleanResults && booleanResults.length > 0) return booleanResults.slice(0, 5);
 
-        // 2) Fallback con LIKE — usando OR en vez de AND para ser menos estricto
-        const conditions = palabras.map(() =>
+        // 2) Fallback con LIKE + puntuación por relevancia
+        //    Buscamos candidatos que coincidan con al menos una palabra,
+        //    y luego los ordenamos por cuántas palabras coinciden.
+        const condiciones = palabras.map(() =>
             `(nombre_producto LIKE ? OR marca_carro LIKE ? OR marca_repuesto LIKE ? OR modelo_vehiculo LIKE ?)`
         ).join(' OR ');
         const params = palabras.flatMap(p => [`%${p}%`, `%${p}%`, `%${p}%`, `%${p}%`]);
 
-        const likeResults = await querySegura(
+        const candidatos = await querySegura(
             `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
                     modelo_vehiculo, precio, stock_actual
              FROM producto
-             WHERE (${conditions}) AND stock_actual > 0
-             LIMIT 5`,
+             WHERE (${condiciones}) AND stock_actual > 0
+             LIMIT 50`,
             params
         );
 
-        return likeResults || [];
+        if (!candidatos || candidatos.length === 0) return [];
+
+        // Puntuar cada candidato
+        const puntuados = candidatos.map(producto => {
+            const textoProducto = [
+                producto.nombre_producto,
+                producto.marca_carro,
+                producto.marca_repuesto,
+                producto.modelo_vehiculo
+            ].filter(Boolean).join(' ').toLowerCase();
+
+            let coincidencias = 0;
+            for (const palabra of palabras) {
+                if (textoProducto.includes(palabra.toLowerCase())) coincidencias++;
+            }
+            return { producto, coincidencias };
+        });
+
+        // Ordenar por coincidencias (mayor primero), y por nombre alfabéticamente si empatan
+        puntuados.sort((a, b) => {
+            if (b.coincidencias !== a.coincidencias) return b.coincidencias - a.coincidencias;
+            return (a.producto.nombre_producto || '').localeCompare(b.producto.nombre_producto || '');
+        });
+
+        return puntuados.slice(0, 5).map(p => p.producto);
     } catch (error) {
         console.error('Error buscando productos:', error.message);
         return [];
@@ -737,8 +763,7 @@ async function buscarProductos(mensajeCliente) {
 }
 
 // ============================================================
-// TASA DEL DÍA
-// ============================================================
+// TASA DEL DÍA// ============================================================
 async function obtenerTasa() {
     const rows = await querySegura('SELECT tasa_dolar FROM configuracion WHERE id = 1');
     if (rows.length === 0 || Number(rows[0].tasa_dolar) <= 0) {
@@ -1416,10 +1441,10 @@ async function procesarMensaje(sock, msg) {
             if (decision.accion === 'buscar_producto') {
                 const consulta = [decision.producto, decision.vehiculo].filter(Boolean).join(' ');
 
-                // 🔥 Búsqueda 1: con lo que extrajo Gemini
+                // Búsqueda 1: con lo que extrajo Gemini
                 let productos = consulta.trim() ? await buscarProductos(consulta) : [];
 
-                // 🔥 Búsqueda 2 (fallback): si no hay resultados, usar el texto original
+                // Búsqueda 2 (fallback): si no hay resultados, usar el texto original
                 if (productos.length === 0) {
                     console.log(`🔄 Búsqueda con Gemini sin resultados. Reintentando con texto original: "${texto}"`);
                     productos = await buscarProductos(texto);
