@@ -115,7 +115,6 @@ class GeminiService {
             throw error;
         }
 
-        // Limpiar historiales expirados
         for (const [cliente, historial] of this.historiales) {
             if (Date.now() - historial.timestamp > this.ttl) {
                 this.historiales.delete(cliente);
@@ -126,7 +125,6 @@ class GeminiService {
         const historial = [...this.obtenerHistorial(jid)];
         if (historial[0]?.role === 'model') historial.shift();
 
-        // 🔥 Reintentos con backoff para errores temporales (503, 500, 429)
         const maxIntentos = 3;
         const delaysMs = [800, 2000, 4000];
         let ultimoError = null;
@@ -426,15 +424,13 @@ async function useSupabaseAuthState(sessionId = 'sildemar-bot') {
 // 🔥 UTILIDADES DE TEXTO
 // ============================================================
 
-// Limpia el texto dejando solo letras, números y vocales acentuadas
 function limpiarTexto(texto) {
     return String(texto || '')
-        .replace(/[^\p{L}\p{N}\s]/gu, ' ')  // quitar símbolos y emojis
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 }
 
-// Quita acentos para comparaciones
 function sinAcentos(texto) {
     return String(texto || '')
         .toLowerCase()
@@ -442,14 +438,12 @@ function sinAcentos(texto) {
         .replace(/[\u0300-\u036f]/g, '');
 }
 
-// 🔥 Detecta si un mensaje NO tiene contenido útil (solo emojis, thumbs up, etc)
 function esMensajeVacio(texto) {
     const limpio = limpiarTexto(texto);
     if (limpio.length < 2) return true;
     return false;
 }
 
-// Normaliza la frase para comparaciones (sin acentos + minúsculas)
 function normalizarFrase(texto) {
     return sinAcentos(limpiarTexto(texto)).toLowerCase();
 }
@@ -460,22 +454,18 @@ function normalizarFrase(texto) {
 function detectarIntencion(texto) {
     const t = normalizarFrase(texto);
 
-    // 🔥 Saludos (incluye singular "buen día" y plural "buenos días")
     if (/^(?:hola+|hey+|saludos|buenas?|buenos?\s+dias?|buen\s+dia|buenas?\s+tardes|buenas?\s+noches|que\s+tal)(?:[\s,]+(?:hola+|hey+|saludos|buenas?|buenos?\s+dias?|buen\s+dia|buenas?\s+tardes|buenas?\s+noches|que\s+tal))*$/i.test(t.trim())) {
         return 'saludo';
     }
 
-    // Agradecimientos
     if (/^(?:(?:bueno|ok|muchas|mil|de verdad|te doy las)\s+)*(?:gracias?|se agradece|te agradezco)(?:\s+(?:por todo|mucho|mil))?$/.test(t)) {
         return 'gracias';
     }
 
-    // Ubicación
     if (/^(?:cual es la\s+)?(?:ubicacion|direccion)(?:\s+de ustedes)?$|^(?:donde queda|donde quedan|donde estan|como llego|como llegar|estan ubicados|me pasas la ubicacion|pasame la ubicacion|ubicacion por favor)$/.test(t)) {
         return 'ubicacion';
     }
 
-    // Horario
     if (/^(?:cual es su\s+)?horario$|^(?:a que hora abren|a que hora cierran|cuando abren|cuando cierran|estan abiertos?)$/.test(t)) {
         return 'horario';
     }
@@ -724,13 +714,13 @@ async function buscarProductos(mensajeCliente) {
 
         if (booleanResults && booleanResults.length > 0) return booleanResults;
 
-        // 2) Fallback: búsqueda con LIKE (más lenta pero siempre funciona)
+        // 2) Fallback con LIKE — usando OR en vez de AND para ser menos estricto
         const conditions = palabras.map(() =>
             `(nombre_producto LIKE ? OR marca_carro LIKE ? OR marca_repuesto LIKE ? OR modelo_vehiculo LIKE ?)`
-        ).join(' AND ');
+        ).join(' OR ');
         const params = palabras.flatMap(p => [`%${p}%`, `%${p}%`, `%${p}%`, `%${p}%`]);
 
-        return querySegura(
+        const likeResults = await querySegura(
             `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
                     modelo_vehiculo, precio, stock_actual
              FROM producto
@@ -738,6 +728,8 @@ async function buscarProductos(mensajeCliente) {
              LIMIT 5`,
             params
         );
+
+        return likeResults || [];
     } catch (error) {
         console.error('Error buscando productos:', error.message);
         return [];
@@ -1402,6 +1394,8 @@ async function procesarMensaje(sock, msg) {
         }
 
         if (decision) {
+            console.log(`🧠 Gemini devolvió:`, JSON.stringify(decision));
+
             if (decision.accion === 'ubicacion') {
                 geminiService.guardarRespuesta(jid, decision.respuesta_texto);
                 await sock.sendMessage(jid, { text: decision.respuesta_texto || respuestaUbicacion() });
@@ -1421,23 +1415,33 @@ async function procesarMensaje(sock, msg) {
             }
             if (decision.accion === 'buscar_producto') {
                 const consulta = [decision.producto, decision.vehiculo].filter(Boolean).join(' ');
-                if (consulta.trim()) {
-                    const productos = await buscarProductos(consulta);
-                    const tasa = await obtenerTasa();
-                    const respuesta = formatearProductos(productos, tasa);
-                    geminiService.guardarRespuesta(jid, respuesta);
-                    if (productos.length > 0) {
-                        guardarSesion(jid, {
-                            etapa: 'resultados',
-                            productos,
-                            nombreWhatsApp: pushName,
-                            telefono: numeroCliente
-                        });
-                    }
-                    await sock.sendMessage(jid, { text: respuesta });
-                    return;
+
+                // 🔥 Búsqueda 1: con lo que extrajo Gemini
+                let productos = consulta.trim() ? await buscarProductos(consulta) : [];
+
+                // 🔥 Búsqueda 2 (fallback): si no hay resultados, usar el texto original
+                if (productos.length === 0) {
+                    console.log(`🔄 Búsqueda con Gemini sin resultados. Reintentando con texto original: "${texto}"`);
+                    productos = await buscarProductos(texto);
                 }
+
+                const tasa = await obtenerTasa();
+                const respuesta = formatearProductos(productos, tasa);
+                geminiService.guardarRespuesta(jid, respuesta);
+
+                if (productos.length > 0) {
+                    guardarSesion(jid, {
+                        etapa: 'resultados',
+                        productos,
+                        nombreWhatsApp: pushName,
+                        telefono: numeroCliente
+                    });
+                }
+                await sock.sendMessage(jid, { text: respuesta });
+                return;
             }
+
+            // conversacion_general u otra acción no listada
             const respuesta = decision.respuesta_texto || respuestaPedirProducto();
             geminiService.guardarRespuesta(jid, respuesta);
             await sock.sendMessage(jid, { text: respuesta });
@@ -1472,7 +1476,6 @@ async function procesarMensaje(sock, msg) {
             await sock.sendMessage(jid, { text: respuestaHorario() });
             return;
         default: {
-            // 🔥 Si no hay palabras de producto válidas, pedir el repuesto en lugar de buscar/notificar
             const palabrasProducto = prepararConsultaProducto(texto);
             if (palabrasProducto.length === 0) {
                 const respuesta = respuestaPedirProducto();
