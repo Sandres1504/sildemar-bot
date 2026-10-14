@@ -567,6 +567,46 @@ function prepararConsultaProducto(texto) {
     return palabras;
 }
 
+function filtrarProductosPorConsulta(productos, productoSolicitado, vehiculoSolicitado) {
+    const palabrasVehiculo = prepararConsultaProducto(vehiculoSolicitado)
+        .filter(palabra => !/^\d{2,4}$/.test(palabra));
+    const palabrasProducto = prepararConsultaProducto(productoSolicitado)
+        .filter(palabra => !palabrasVehiculo.includes(palabra) && !/^\d{2,4}$/.test(palabra));
+
+    if (palabrasProducto.length === 0) return [];
+
+    return productos.filter(producto => {
+        const textoProducto = sinAcentos([
+            producto.nombre_producto,
+            producto.marca_repuesto
+        ].filter(Boolean).join(' ')).toUpperCase();
+        const textoVehiculo = sinAcentos([
+            producto.marca_carro,
+            producto.modelo_vehiculo
+        ].filter(Boolean).join(' ')).toUpperCase();
+
+        const coincideRepuesto = palabrasProducto.every(palabra =>
+            textoProducto.includes(sinAcentos(palabra).toUpperCase())
+        );
+        const coincideVehiculo = palabrasVehiculo.every(palabra =>
+            textoVehiculo.includes(sinAcentos(palabra).toUpperCase())
+        );
+
+        return coincideRepuesto && coincideVehiculo;
+    });
+}
+
+function extraerVehiculoExplicito(texto) {
+    const coincidencia = limpiarTexto(texto)
+        .match(/\b(?:para|del carro|del vehiculo|vehiculo|carro)\s+(.+)$/i);
+    if (!coincidencia) return '';
+
+    return prepararConsultaProducto(coincidencia[1])
+        .filter(palabra => !/^\d{2,4}$/.test(palabra))
+        .slice(0, 4)
+        .join(' ');
+}
+
 // ============================================================
 // DETECCIÓN DE SELECCIÓN
 // ============================================================
@@ -684,78 +724,60 @@ function esMensajePropioDelNegocio(texto) {
 }
 
 // ============================================================
-// BUSCAR PRODUCTOS CON PUNTUACIÓN POR RELEVANCIA
+// BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA
 // ============================================================
-async function buscarProductos(mensajeCliente) {
+async function buscarProductos(mensajeCliente, detalleConsulta = null) {
     try {
         const palabras = prepararConsultaProducto(mensajeCliente);
         if (palabras.length === 0) return [];
 
-        // 1) Intentar búsqueda FULLTEXT si el índice existe
-        const booleanQuery = palabras.map(p => `+${p}*`).join(' ');
-        let booleanResults = [];
-        try {
-            booleanResults = await querySegura(
-                `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
-                        modelo_vehiculo, precio, stock_actual,
-                        MATCH(nombre_producto, marca_carro, marca_repuesto, modelo_vehiculo)
-                              AGAINST(? IN BOOLEAN MODE) AS score
-                 FROM producto
-                 WHERE MATCH(nombre_producto, marca_carro, marca_repuesto, modelo_vehiculo)
-                       AGAINST(? IN BOOLEAN MODE)
-                       AND stock_actual > 0
-                 ORDER BY score DESC
-                 LIMIT 10`,
-                [booleanQuery, booleanQuery]
-            );
-        } catch (error) {
-            console.warn('FULLTEXT no disponible, usando LIKE:', error.message);
-        }
+        const palabrasVehiculo = detalleConsulta
+            ? prepararConsultaProducto(detalleConsulta.vehiculo)
+                .filter(palabra => !/^\d{2,4}$/.test(palabra))
+            : [];
+        const palabrasRepuesto = detalleConsulta
+            ? prepararConsultaProducto(detalleConsulta.producto)
+                .filter(palabra => !palabrasVehiculo.includes(palabra) && !/^\d{2,4}$/.test(palabra))
+            : palabras.filter(palabra => !/^\d{2,4}$/.test(palabra));
 
-        if (booleanResults && booleanResults.length > 0) return booleanResults.slice(0, 5);
+        if (palabrasRepuesto.length === 0) return [];
 
-        // 2) Fallback con LIKE + puntuación por relevancia
-        //    Buscamos candidatos que coincidan con al menos una palabra,
-        //    y luego los ordenamos por cuántas palabras coinciden.
-        const condiciones = palabras.map(() =>
-            `(nombre_producto LIKE ? OR marca_carro LIKE ? OR marca_repuesto LIKE ? OR modelo_vehiculo LIKE ?)`
-        ).join(' OR ');
-        const params = palabras.flatMap(p => [`%${p}%`, `%${p}%`, `%${p}%`, `%${p}%`]);
+        const condicionesRepuesto = palabrasRepuesto.map(() =>
+            detalleConsulta
+                ? '(nombre_producto LIKE ? OR marca_repuesto LIKE ?)'
+                : '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR marca_carro LIKE ? OR modelo_vehiculo LIKE ?)'
+        );
+
+        const condicionesVehiculo = palabrasVehiculo.map(() =>
+            '(marca_carro LIKE ? OR modelo_vehiculo LIKE ?)'
+        );
+        const condiciones = [...condicionesRepuesto, ...condicionesVehiculo].join(' AND ');
+        const paramsRepuesto = palabrasRepuesto.flatMap(palabra => {
+            const like = `%${palabra}%`;
+            return detalleConsulta ? [like, like] : [like, like, like, like];
+        });
+        const paramsVehiculo = palabrasVehiculo.flatMap(palabra => {
+            const like = `%${palabra}%`;
+            return [like, like];
+        });
 
         const candidatos = await querySegura(
             `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
                     modelo_vehiculo, precio, stock_actual
              FROM producto
-             WHERE (${condiciones}) AND stock_actual > 0
-             LIMIT 50`,
-            params
+             WHERE ${condiciones} AND stock_actual > 0
+             LIMIT 100`,
+            [...paramsRepuesto, ...paramsVehiculo]
         );
 
         if (!candidatos || candidatos.length === 0) return [];
 
-        // Puntuar cada candidato
-        const puntuados = candidatos.map(producto => {
-            const textoProducto = [
-                producto.nombre_producto,
-                producto.marca_carro,
-                producto.marca_repuesto,
-                producto.modelo_vehiculo
-            ].filter(Boolean).join(' ').toLowerCase();
-
-            let coincidencias = 0;
-            for (const palabra of palabras) {
-                if (textoProducto.includes(palabra.toLowerCase())) coincidencias++;
-            }
-            return { producto, coincidencias };
-        });
-
-        // Ordenar por coincidencias (mayor primero), y por nombre alfabéticamente si empatan
-        puntuados.sort((a, b) => {
-            if (b.coincidencias !== a.coincidencias) return b.coincidencias - a.coincidencias;
-            return (a.producto.nombre_producto || '').localeCompare(b.producto.nombre_producto || '');
-        });
-
-        return puntuados.slice(0, 5).map(p => p.producto);
+        const relevantes = detalleConsulta
+            ? filtrarProductosPorConsulta(candidatos, detalleConsulta.producto, detalleConsulta.vehiculo)
+            : candidatos;
+        return relevantes
+            .sort((a, b) => (a.nombre_producto || '').localeCompare(b.nombre_producto || ''))
+            .slice(0, 5);
     } catch (error) {
         console.error('Error buscando productos:', error.message);
         return [];
@@ -1439,16 +1461,14 @@ async function procesarMensaje(sock, msg) {
                 return;
             }
             if (decision.accion === 'buscar_producto') {
-                const consulta = [decision.producto, decision.vehiculo].filter(Boolean).join(' ');
-
-                // Búsqueda 1: con lo que extrajo Gemini
-                let productos = consulta.trim() ? await buscarProductos(consulta) : [];
-
-                // Búsqueda 2 (fallback): si no hay resultados, usar el texto original
-                if (productos.length === 0) {
-                    console.log(`🔄 Búsqueda con Gemini sin resultados. Reintentando con texto original: "${texto}"`);
-                    productos = await buscarProductos(texto);
-                }
+                const vehiculo = decision.vehiculo || extraerVehiculoExplicito(texto);
+                const consulta = [decision.producto, vehiculo].filter(Boolean).join(' ');
+                const productos = consulta.trim()
+                    ? await buscarProductos(consulta, {
+                        producto: decision.producto,
+                        vehiculo
+                    })
+                    : [];
 
                 const tasa = await obtenerTasa();
                 const respuesta = formatearProductos(productos, tasa);
@@ -1658,6 +1678,8 @@ module.exports = {
     GeminiService,
     respuestaErrorGemini,
     prepararConsultaProducto,
+    filtrarProductosPorConsulta,
+    extraerVehiculoExplicito,
     detectarIntencion,
     detectarSeguimientoProducto,
     respuestaUbicacion,
