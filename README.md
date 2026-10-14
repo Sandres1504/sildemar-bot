@@ -1,67 +1,108 @@
-# Bot de WhatsApp de Sildemar
+# Bot de WhatsApp Sildemar
 
-El bot consulta el inventario y la tasa de cambio en MySQL, crea solicitudes
-pendientes de WhatsApp con sus detalles en una transacción y remite a gerencia
-las fichas de despacho y las consultas de productos sin disponibilidad.
+Asistente de WhatsApp con Baileys + Gemini que consulta el inventario MySQL y
+crea solicitudes pendientes con sus detalles, notificando a gerencia para el
+despacho. Combina IA conversacional (Gemini) con lógica tradicional de
+detección de intenciones como respaldo.
 
-## Variables de entorno
+## Características
 
-Configura estas variables en Render. No publiques el archivo `.env` ni valores
-reales de credenciales:
+- **IA conversacional** con Google Gemini 2.5 Flash: interpreta el lenguaje
+  natural del cliente, mantiene contexto por número de WhatsApp (hasta 10
+  intercambios durante 30 minutos) y devuelve respuestas amables.
+- **Búsqueda en inventario**: consulta MySQL por FULLTEXT y como respaldo por
+  LIKE. Los precios y el stock siempre vienen del inventario real, nunca de la IA.
+- **Flujo de pedidos por etapas**: selección → cantidad → identidad → método de
+  entrega (Delivery Local / Envío Nacional) → confirmación → notificación a gerencia.
+- **Notificaciones a gerencia**: fichas de despacho y consultas de productos sin
+  disponibilidad. La gerencia puede responder citando la notificación original.
+- **Filtros de mensajes**: ignora grupos, listas de precios, mensajes vacíos y
+  mensajes propios del negocio.
+
+## Configuración local
+
+1. Instala Node.js 20 o superior.
+2. Instala las dependencias con `npm install`.
+3. Copia `.env.example` a `.env` y completa **todos** los valores:
+   - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` (MySQL inventario).
+   - `DATABASE_URL` (PostgreSQL Supabase para la sesión Baileys).
+   - `GEMINI_API_KEY` (API key de Google AI Studio).
+   - `GERENTE_DELIVERY_PHONE`, `GERENTE_SHIPPING_PHONE` (contactos de gerencia).
+4. Inicia el bot con `npm start` y escanea el QR que aparece en la terminal.
+
+### Obtener la API key de Gemini
+
+1. Ve a https://aistudio.google.com/app/apikey
+2. Inicia sesión con tu cuenta de Google.
+3. Haz clic en **"Crear clave de API"**.
+4. Copia la clave (empieza con `AIza...`) y pégala en `GEMINI_API_KEY`.
+5. **Nunca** subas la clave al repositorio. Guárdala solo en `.env` local y en las
+   variables de entorno de Render.
+
+### Variables de entorno
 
 | Variable | Uso |
 | --- | --- |
 | `DB_HOST` | Host MySQL habilitado para conexiones desde Render |
 | `DB_PORT` | Puerto MySQL; normalmente `3306` |
-| `DB_NAME` | Base de datos |
+| `DB_NAME` | Base de datos del inventario |
 | `DB_USER` | Usuario MySQL |
 | `DB_PASSWORD` | Contraseña MySQL |
-| `GERENTE_DELIVERY_PHONE` | Contacto de despacho local; tiene un valor predeterminado |
-| `GERENTE_SHIPPING_PHONE` | Contacto de envíos nacionales; tiene un valor predeterminado |
 | `DATABASE_URL` | PostgreSQL de Supabase usado para persistir la sesión de Baileys |
+| `GEMINI_API_KEY` | API key de Google AI Studio (Gemini) |
+| `GERENTE_DELIVERY_PHONE` | Contacto de despacho local |
+| `GERENTE_SHIPPING_PHONE` | Contacto de envíos nacionales |
 | `PORT` | Puerto HTTP asignado por Render |
 
-En cPanel, configura también `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` y,
-si corresponde, `DB_PORT` para PHP. `DB_HOST` puede ser distinto entre Render y
-cPanel. Si el hosting no permite conexiones MySQL remotas, habilita el acceso
-remoto y autoriza las direcciones IP de salida de Render antes de probar el bot.
+### Preparación de MySQL
 
-## Preparación de MySQL
-
-Al iniciar, el bot crea las tablas auxiliares
-`whatsapp_solicitudes` y `whatsapp_notificaciones` si no existen. El usuario
-MySQL de Render necesita permiso `CREATE` en la base de datos. Si la política de
-cPanel no permite ese permiso, un administrador puede importar
+Al iniciar, el bot crea las tablas auxiliares `whatsapp_solicitudes` y
+`whatsapp_notificaciones` si no existen. El usuario MySQL de Render necesita
+permiso `CREATE` en la base de datos. Si la política de cPanel no permite ese
+permiso, un administrador puede importar
 [`../backend/sql/whatsapp_integration.sql`](../backend/sql/whatsapp_integration.sql)
 una vez; luego el bot solo necesita permisos de lectura/escritura habituales.
 
 El usuario MySQL también necesita lectura/escritura sobre las tablas de
 inventario, clientes y solicitudes, y lectura sobre `information_schema`.
 
-La integración utiliza las columnas de `persona`, `cliente`, `producto`,
-`solicitud` y `detalle_solicitud` que ya emplea el backend PHP. Las tablas
-complementarias almacenan el canal de origen, los datos de despacho y la
-referencia necesaria para encaminar las respuestas citadas de gerencia.
+## Configuración en Render
 
-## Flujo
+En la sección **Environment** del servicio:
 
-El cliente busca un producto, selecciona una opción, indica cantidad y los datos
-de identidad necesarios. Después elige Delivery Local o Envío Nacional (Zoom /
-MRW) y entrega la ubicación/dirección o los datos de la agencia. Al confirmar,
-el bot reserva existencias y escribe la solicitud, los detalles y los datos de
-despacho dentro de la misma transacción. La ficha local se envía al contacto
-`GERENTE_DELIVERY_PHONE`; la ficha de envío nacional, a `GERENTE_SHIPPING_PHONE`.
+- Configura `GEMINI_API_KEY` (nueva, generada después de revocar cualquier
+  clave expuesta).
+- Configura `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` y
+  `DATABASE_URL`.
+- Render asigna `PORT` automáticamente; no lo configures manualmente.
 
-Las consultas sin producto disponible se registran y se remiten a ventas con una
-referencia y se envían a ambos contactos. El número local con prefijo 0 se
-normaliza a código internacional de Venezuela al generar el JID de WhatsApp.
-Gerencia puede responder citando la notificación original. También puede enviar
-una respuesta normal si tiene una sola notificación pendiente; si hay varias,
-el bot pedirá citar la notificación para no enviar el texto al cliente equivocado.
-Después de reenviarla, el bot confirma el envío y agradece al gerente.
+Después de guardar, haz un **Manual Deploy** o espera al redeploy automático.
 
-Usa [`.env.example`](./.env.example) como referencia para las variables locales
-y configura otros números en Render solo si necesitas cambiar los contactos.
-Si faltan esas variables, el bot usa los dos números acordados como valores
-predeterminados. Añade las credenciales reales de tu entorno local sin compartir
-ni subir el archivo `.env`.
+## Flujo del bot
+
+1. El cliente envía un mensaje.
+2. Gemini interpreta la intención y devuelve una acción (`buscar_producto`,
+   `saludo`, `ubicacion`, `agradecimiento`, `conversacion_general`) junto con
+   el repuesto y vehículo si los identifica.
+3. Si la acción es `buscar_producto`, el bot consulta MySQL y responde con
+   precios y stock reales.
+4. Si el cliente selecciona un producto, se inicia el flujo de pedido por etapas.
+5. Al confirmar, el bot reserva stock en MySQL dentro de una transacción, crea
+   la solicitud y notifica a gerencia.
+6. Si Gemini falla o no está configurada, el bot cae al flujo tradicional de
+   detección de intenciones por expresiones regulares.
+
+## Pruebas
+
+Ejecuta `npm test` para correr las pruebas locales del servicio de Gemini y de
+la preparación de consultas. Las pruebas usan una respuesta simulada y no
+necesitan llamar a Gemini.
+
+## Seguridad
+
+- Nunca subas `.env` al repositorio. Verifica con `git check-ignore .env`.
+- `.env.example` solo debe contener placeholders, nunca claves reales.
+- Si una API key se expone (en un chat, captura o commit), revócala
+  inmediatamente en https://aistudio.google.com/app/apikey y genera una nueva.
+- Los mensajes procesados se envían a la API de Gemini. Revisa las políticas
+  de privacidad de Google AI Studio si manejas información sensible.
