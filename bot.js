@@ -186,7 +186,7 @@ const SESSION_TTL = 30 * 60 * 1000; // 30 minutos
 const modoHumano = new Map();
 const MODO_HUMANO_MS = 10 * 60 * 1000; // 10 minutos de pausa
 
-// Estado global del bot (para comandos /pausar)
+// Estado global del bot
 let botPausado = false;
 
 function estaEnModoHumano(jid) {
@@ -299,7 +299,7 @@ async function conectarBD() {
             throw error;
         }
 
-        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones', 'whatsapp_notificacion_mensajes', 'whatsapp_errores']) {
+        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones', 'whatsapp_notificacion_mensajes']) {
             const [tables] = await pool.execute(
                 `SELECT 1 FROM information_schema.TABLES
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
@@ -571,7 +571,6 @@ function respuestaSeguimiento(sesion, tipo, tasa) {
     return texto;
 }
 
-// Devuelve true solo si la palabra parece un año de vehículo (4 dígitos, 1900-2099)
 function esAnioVehiculo(palabra) {
     if (!/^\d{4}$/.test(palabra)) return false;
     const n = parseInt(palabra, 10);
@@ -817,46 +816,63 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
 
         if (palabrasRepuesto.length === 0) return candidatosCodigo.slice(0, 5);
 
-        // Búsqueda Difusa (SOUNDEX) para errores de ortografía
-        const condicionesRepuesto = palabrasRepuesto.map(() =>
-            detalleConsulta
-                ? '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR codigo LIKE ? OR SOUNDEX(nombre_producto) = SOUNDEX(?))'
-                : '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR marca_carro LIKE ? OR modelo_vehiculo LIKE ? OR codigo LIKE ? OR SOUNDEX(nombre_producto) = SOUNDEX(?))'
-        );
-
-        const condicionesVehiculo = vehiculoFiltrado.map(() =>
-            '(marca_carro LIKE ? OR modelo_vehiculo LIKE ?)'
-        );
-        const condiciones = [...condicionesRepuesto, ...condicionesVehiculo].join(' AND ');
+        let condicionesFinales = [];
         
-        const paramsRepuesto = palabrasRepuesto.flatMap(palabra => {
-            const like = `%${palabra}%`;
-            return detalleConsulta 
-                ? [like, like, like, palabra] 
-                : [like, like, like, like, like, palabra];
-        });
-        const paramsVehiculo = vehiculoFiltrado.flatMap(palabra => {
-            const like = `%${palabra}%`;
-            return [like, like];
+        palabrasRepuesto.forEach(palabra => {
+            let variants = [palabra];
+            if (palabra.length > 3 && palabra.endsWith('S')) {
+                variants.push(palabra.slice(0, -1)); // Ej: BUJES -> BUJE
+            }
+            
+            const subCondiciones = variants.map(v => `nombre_producto LIKE '%${v}%' OR marca_repuesto LIKE '%${v}%' OR codigo LIKE '%${v}%'`).join(' OR ');
+            condicionesFinales.push(`(${subCondiciones})`);
         });
 
-        const candidatos = await querySegura(
-            `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
-                    modelo_vehiculo, precio, stock_actual
-             FROM producto
-             WHERE ${condiciones} AND stock_actual > 0
-             LIMIT 100`,
-            [...paramsRepuesto, ...paramsVehiculo]
-        );
+        vehiculoFiltrado.forEach(palabra => {
+            condicionesFinales.push(`(marca_carro LIKE '%${palabra}%' OR modelo_vehiculo LIKE '%${palabra}%')`);
+        });
 
-        if (!candidatos || candidatos.length === 0) return candidatosCodigo.slice(0, 5);
+        const sql = `
+            SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
+                   modelo_vehiculo, precio, stock_actual
+            FROM producto
+            WHERE (${condicionesFinales.join(' AND ')}) AND stock_actual > 0
+            LIMIT 100
+        `;
+
+        let candidatos = await querySegura(sql);
+
+        // Búsqueda de RESCATE si el filtro estricto (con vehículo) falló
+        if (!candidatos || candidatos.length === 0) {
+            const rescateCondiciones = palabrasRepuesto.map(palabra => {
+                let variants = [palabra];
+                if (palabra.length > 3 && palabra.endsWith('S')) variants.push(palabra.slice(0, -1));
+                return variants.map(v => `nombre_producto LIKE '%${v}%'`).join(' OR ');
+            }).join(' AND ');
+
+            const rescateSQL = `
+                SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
+                       modelo_vehiculo, precio, stock_actual
+                FROM producto
+                WHERE (${rescateCondiciones}) AND stock_actual > 0
+                LIMIT 10
+            `;
+            const rescate = await querySegura(rescateSQL);
+            if (rescate && rescate.length > 0) return rescate.slice(0, 5);
+
+            return candidatosCodigo.slice(0, 5);
+        }
 
         const relevantes = detalleConsulta
             ? filtrarProductosPorConsulta(candidatos, detalleConsulta.producto, detalleConsulta.vehiculo)
             : candidatos;
-        return relevantes
+
+        const resultadoFinal = relevantes.length > 0 ? relevantes : candidatos;
+        
+        return resultadoFinal
             .sort((a, b) => (a.nombre_producto || '').localeCompare(b.nombre_producto || ''))
             .slice(0, 5);
+            
     } catch (error) {
         console.error('Error buscando productos:', error.message);
         return [];
@@ -1009,9 +1025,8 @@ async function enviarNotificacionGerencia(sock, datos, texto, contacto, msgOrigi
         }
         await registrarMensajeGerencia(pool, notificacion.id, resultado.key.id);
 
-        // REENVÍO DEL MENSAJE ORIGINAL DEL CLIENTE
         if (msgOriginal) {
-            await new Promise(r => setTimeout(r, 1500)); // Pausa de 1.5s para no saturar
+            await new Promise(r => setTimeout(r, 1500));
             const forwardResult = await sock.sendMessage(contacto.jid, {
                 forward: msgOriginal,
                 contextInfo: { forwardingScore: 1, isForwarded: true }
@@ -1489,7 +1504,7 @@ async function procesarMensaje(sock, msg) {
 
     if (botPausado) return;
 
-    // NUEVO: Si el humano intervino, el bot se calla
+    // Si el humano intervino, el bot se calla
     if (estaEnModoHumano(jid)) {
         console.log(`⏸️ Bot pausado para ${jid} (modo humano)`);
         return;
@@ -1619,9 +1634,7 @@ async function procesarMensaje(sock, msg) {
         }
     }
 
-    // ============================================================
     // FLUJO PRINCIPAL: Gemini primero, fallback a la lógica tradicional
-    // ============================================================
     if (geminiService.model) {
         let decision;
         try {
@@ -1705,9 +1718,7 @@ async function procesarMensaje(sock, msg) {
         }
     }
 
-    // ============================================================
     // FALLBACK: lógica tradicional (sin Gemini)
-    // ============================================================
     const seguimiento = detectarSeguimientoProducto(texto);
     if (seguimiento) {
         const tasa = seguimiento === 'precio' ? await obtenerTasa() : 1;
@@ -1822,7 +1833,6 @@ async function iniciarBot() {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-            // CONTROL DEL MODO HUMANO: Si el bot (tú o un gerente) envía un mensaje manualmente
             if (msg.key.fromMe && msg.key.remoteJid && !esMensajeDeGrupo(msg.key.remoteJid)) {
                 const jid = msg.key.remoteJid;
                 if (!esJidGerencia(jid, null) && !esJidDueno(jid, null)) {
