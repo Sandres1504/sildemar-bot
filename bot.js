@@ -18,7 +18,10 @@ const {
     obtenerContactosParaNotificacion,
     normalizarNumeroWhatsApp,
     registrarMensajeGerencia,
-    registrarRespuestaGerencia
+    registrarRespuestaGerencia,
+    obtenerTelefonoDueno,
+    registrarError,
+    obtenerEstadisticas
 } = require('./whatsapp-service');
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 
@@ -183,6 +186,9 @@ const SESSION_TTL = 30 * 60 * 1000; // 30 minutos
 const modoHumano = new Map();
 const MODO_HUMANO_MS = 10 * 60 * 1000; // 10 minutos de pausa
 
+// Estado global del bot (para comandos /pausar)
+let botPausado = false;
+
 function estaEnModoHumano(jid) {
     const estado = modoHumano.get(jid);
     if (!estado) return false;
@@ -210,6 +216,7 @@ function obtenerSesion(jid) {
 
 function limpiarSesion(jid) {
     userSessions.delete(jid);
+    geminiService.historiales.delete(jid);
 }
 
 // ============================================================
@@ -292,7 +299,7 @@ async function conectarBD() {
             throw error;
         }
 
-        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones', 'whatsapp_notificacion_mensajes']) {
+        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones', 'whatsapp_notificacion_mensajes', 'whatsapp_errores']) {
             const [tables] = await pool.execute(
                 `SELECT 1 FROM information_schema.TABLES
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
@@ -325,6 +332,7 @@ async function querySegura(sql, params = []) {
     } catch (err) {
         mysqlFallos++;
         console.error(`⚠️  Error MySQL (${mysqlFallos}/${MYSQL_MAX_FALLOS}):`, err.message);
+        await registrarError(pool, null, 'MySQL_Query', err.message, err.stack);
 
         if (mysqlFallos >= MYSQL_MAX_FALLOS) {
             console.log('🔄 Reiniciando pool MySQL...');
@@ -744,7 +752,7 @@ function esMensajePropioDelNegocio(texto) {
 }
 
 // ============================================================
-// BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA
+// BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA Y DIFUSA
 // ============================================================
 function esCodigoProducto(texto) {
     const limpio = texto.trim().replace(/\s+/g, '');
@@ -809,19 +817,23 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
 
         if (palabrasRepuesto.length === 0) return candidatosCodigo.slice(0, 5);
 
+        // Búsqueda Difusa (SOUNDEX) para errores de ortografía
         const condicionesRepuesto = palabrasRepuesto.map(() =>
             detalleConsulta
-                ? '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR codigo LIKE ?)'
-                : '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR marca_carro LIKE ? OR modelo_vehiculo LIKE ? OR codigo LIKE ?)'
+                ? '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR codigo LIKE ? OR SOUNDEX(nombre_producto) = SOUNDEX(?))'
+                : '(nombre_producto LIKE ? OR marca_repuesto LIKE ? OR marca_carro LIKE ? OR modelo_vehiculo LIKE ? OR codigo LIKE ? OR SOUNDEX(nombre_producto) = SOUNDEX(?))'
         );
 
         const condicionesVehiculo = vehiculoFiltrado.map(() =>
             '(marca_carro LIKE ? OR modelo_vehiculo LIKE ?)'
         );
         const condiciones = [...condicionesRepuesto, ...condicionesVehiculo].join(' AND ');
+        
         const paramsRepuesto = palabrasRepuesto.flatMap(palabra => {
             const like = `%${palabra}%`;
-            return detalleConsulta ? [like, like, like] : [like, like, like, like, like];
+            return detalleConsulta 
+                ? [like, like, like, palabra] 
+                : [like, like, like, like, like, palabra];
         });
         const paramsVehiculo = vehiculoFiltrado.flatMap(palabra => {
             const like = `%${palabra}%`;
@@ -969,6 +981,18 @@ function identificarGerencia(jid, jidAlternativo) {
 
 function esJidGerencia(jid, jidAlternativo) {
     return Boolean(identificarGerencia(jid, jidAlternativo));
+}
+
+function esJidDueno(jid, jidAlternativo) {
+    try {
+        const telefonoDueno = obtenerTelefonoDueno();
+        for (const valor of [jid, jidAlternativo]) {
+            if (!valor) continue;
+            const telefono = normalizarNumeroWhatsApp(obtenerTelefonoJid(valor));
+            if (telefono === telefonoDueno) return true;
+        }
+    } catch {}
+    return false;
 }
 
 function crearWaMe(telefono) {
@@ -1429,16 +1453,54 @@ async function procesarMensaje(sock, msg) {
     const jid = msg.key.remoteJid;
     if (!jid || esMensajeDeGrupo(jid)) return;
 
+    const mensaje = desenvolverMensaje(msg.message);
+    const texto = extraerTexto(mensaje);
+    const ubicacion = extraerUbicacion(msg.message);
+    const jidAlternativo = msg.key.remoteJidAlt;
+
+    // COMANDOS DEL DUEÑO (Administración)
+    if (esJidDueno(jid, jidAlternativo)) {
+        const t = texto.trim().toLowerCase();
+        if (t === '/pausar') {
+            botPausado = true;
+            await sock.sendMessage(jid, { text: '⏸️ Bot pausado globalmente. Ningún cliente recibirá respuestas hasta que uses /reanudar.' });
+            return;
+        }
+        if (t === '/reanudar') {
+            botPausado = false;
+            await sock.sendMessage(jid, { text: '▶️ Bot reanudado. Los clientes volverán a recibir respuestas.' });
+            return;
+        }
+        if (t === '/status') {
+            const status = pool ? '✅ Conectado a MySQL' : '❌ Desconectado de MySQL';
+            await sock.sendMessage(jid, { text: `🤖 *Estado del Bot*\n\n${status}\nGemini: ${geminiService.model ? '✅ Activo' : '❌ Inactivo'}` });
+            return;
+        }
+        if (t === '/stats') {
+            const stats = await obtenerEstadisticas(pool);
+            if (stats) {
+                await sock.sendMessage(jid, { text: `📊 *Estadísticas (Pendientes)*\n\nConsultas en espera: ${stats.consultas}\nPedidos en espera: ${stats.pedidos}\nErrores últimas 24h: ${stats.errores}` });
+            } else {
+                await sock.sendMessage(jid, { text: 'No se pudieron obtener estadísticas.' });
+            }
+            return;
+        }
+    }
+
+    if (botPausado) return;
+
     // NUEVO: Si el humano intervino, el bot se calla
     if (estaEnModoHumano(jid)) {
         console.log(`⏸️ Bot pausado para ${jid} (modo humano)`);
         return;
     }
 
-    const mensaje = desenvolverMensaje(msg.message);
-    const texto = extraerTexto(mensaje);
-    const ubicacion = extraerUbicacion(msg.message);
-    const jidAlternativo = msg.key.remoteJidAlt;
+    // COMANDO PARA REINICIAR CLIENTE
+    if (['/menu', '/inicio', '/reset', 'menu', 'inicio'].includes(texto.trim().toLowerCase())) {
+        limpiarSesion(jid);
+        await sock.sendMessage(jid, { text: respuestaSaludo(msg.pushName || 'Cliente') });
+        return;
+    }
 
     const tipoGerencia = identificarGerencia(jid, jidAlternativo);
     if (tipoGerencia) {
@@ -1477,7 +1539,7 @@ async function procesarMensaje(sock, msg) {
             }
 
             await sock.sendMessage(notificacion.client_jid, {
-                text: `💬 Respuesta de gerencia:\n\n${texto.trim()}`
+                text: texto.trim()
             });
             respuestaEntregada = true;
             const respuestaRegistrada = await registrarRespuestaGerencia(pool, notificacion.id, texto.trim());
@@ -1566,6 +1628,7 @@ async function procesarMensaje(sock, msg) {
             decision = await geminiService.generarRespuesta(texto, jid);
         } catch (error) {
             console.warn('Gemini falló, usando lógica tradicional:', error.message);
+            await registrarError(pool, jid, 'Gemini_Error', error.message, error.stack);
             decision = null;
         }
 
@@ -1614,7 +1677,6 @@ async function procesarMensaje(sock, msg) {
                     return;
                 }
 
-                // NUEVO: Si no hay producto, avisamos a AMBOS gerentes con el Forward
                 const referencia = `CONS-${Date.now().toString(36).toUpperCase()}`;
                 try {
                     await notificarProductoNoDisponible(sock, {
@@ -1622,7 +1684,7 @@ async function procesarMensaje(sock, msg) {
                         nombre: pushName,
                         telefono: numeroCliente,
                         referencia
-                    }, consulta || texto, msg); // <-- Pasamos 'msg' para el forward
+                    }, consulta || texto, msg);
                     
                     respuesta = `no encontré ese repuesto en el inventario 🤔\n\n` +
                                `Envié tu consulta al área de ventas con la referencia ${referencia}. ` +
@@ -1636,7 +1698,6 @@ async function procesarMensaje(sock, msg) {
                 return;
             }
 
-            // conversacion_general u otra acción no listada
             const respuesta = decision.respuesta_texto || respuestaPedirProducto();
             geminiService.guardarRespuesta(jid, respuesta);
             await sock.sendMessage(jid, { text: respuesta });
@@ -1698,7 +1759,7 @@ async function procesarMensaje(sock, msg) {
                     nombre: pushName,
                     telefono: numeroCliente,
                     referencia
-                }, texto, msg); // <-- Pasamos 'msg' para el forward
+                }, texto, msg);
                 await sock.sendMessage(jid, {
                     text: `No encontré disponibilidad en el inventario para "${texto}". ` +
                         'Envié tu consulta al área de ventas para verificar depósitos y proveedores. ' +
@@ -1761,14 +1822,14 @@ async function iniciarBot() {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-            // CONTROL DEL MODO HUMANO: Si el bot (tú) envía un mensaje, pausamos las respuestas a ese cliente
+            // CONTROL DEL MODO HUMANO: Si el bot (tú o un gerente) envía un mensaje manualmente
             if (msg.key.fromMe && msg.key.remoteJid && !esMensajeDeGrupo(msg.key.remoteJid)) {
                 const jid = msg.key.remoteJid;
-                if (!esJidGerencia(jid, null)) {
+                if (!esJidGerencia(jid, null) && !esJidDueno(jid, null)) {
                     modoHumano.set(jid, { hasta: Date.now() + MODO_HUMANO_MS });
                     console.log(`👤 Modo humano activado para ${jid} por 10 minutos.`);
                 }
-                continue; // No procesar como mensaje entrante normal
+                continue;
             }
 
             try {
@@ -1776,6 +1837,7 @@ async function iniciarBot() {
             } catch (error) {
                 console.error('Error procesando mensaje entrante:', error);
                 const jid = msg?.key?.remoteJid;
+                await registrarError(pool, jid, 'ProcesarMensaje_Error', error.message, error.stack);
                 if (jid && !esMensajeDeGrupo(jid) && !esJidGerencia(jid, msg.key.remoteJidAlt)) {
                     try {
                         await sock.sendMessage(jid, {
