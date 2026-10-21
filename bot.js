@@ -179,6 +179,20 @@ const geminiService = new GeminiService(model);
 const userSessions = new Map();
 const SESSION_TTL = 30 * 60 * 1000; // 30 minutos
 
+// Memoria para el Modo Humano
+const modoHumano = new Map();
+const MODO_HUMANO_MS = 10 * 60 * 1000; // 10 minutos de pausa
+
+function estaEnModoHumano(jid) {
+    const estado = modoHumano.get(jid);
+    if (!estado) return false;
+    if (Date.now() > estado.hasta) {
+        modoHumano.delete(jid);
+        return false;
+    }
+    return true;
+}
+
 function guardarSesion(jid, sesion) {
     userSessions.set(jid, { ...sesion, timestamp: Date.now() });
 }
@@ -278,7 +292,7 @@ async function conectarBD() {
             throw error;
         }
 
-        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones']) {
+        for (const table of ['whatsapp_solicitudes', 'whatsapp_notificaciones', 'whatsapp_notificacion_mensajes']) {
             const [tables] = await pool.execute(
                 `SELECT 1 FROM information_schema.TABLES
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
@@ -423,7 +437,6 @@ async function useSupabaseAuthState(sessionId = 'sildemar-bot') {
 // ============================================================
 // 🔥 UTILIDADES DE TEXTO
 // ============================================================
-
 function limpiarTexto(texto) {
     return String(texto || '')
         .replace(/[^\p{L}\p{N}\s]/gu, ' ')
@@ -551,7 +564,6 @@ function respuestaSeguimiento(sesion, tipo, tasa) {
 }
 
 // Devuelve true solo si la palabra parece un año de vehículo (4 dígitos, 1900-2099)
-// Números como "110", "92", "4x4" NO son años y NO deben filtrarse
 function esAnioVehiculo(palabra) {
     if (!/^\d{4}$/.test(palabra)) return false;
     const n = parseInt(palabra, 10);
@@ -571,18 +583,13 @@ function prepararConsultaProducto(texto) {
         'VENDEN', 'ALGUN', 'ALGUNA', 'ALGUNO', 'QUISIERA', 'SABER'
     ]);
     const limpio = limpiarTexto(texto).toUpperCase();
-    // Solo separar dígitos de letras cuando la parte alfabética es >= 3 caracteres
-    // (es una palabra real como "DIENTES", no parte de un código como "A346Y522MM")
     const normalizado = limpio
-        .replace(/(\d+)([A-Z]{3,})/g, '$1 $2')   // 110DIENTES → "110 DIENTES"
-        .replace(/([A-Z]{3,})(\d+)/g, '$1 $2');   // CORSA2008 → "CORSA 2008"
-    const palabras = normalizado.split(' ').filter(p => p.length >= 2 && !stopWords.has(p));
-    return palabras;
+        .replace(/(\d+)([A-Z]{3,})/g, '$1 $2')
+        .replace(/([A-Z]{3,})(\d+)/g, '$1 $2');
+    return normalizado.split(' ').filter(p => p.length >= 2 && !stopWords.has(p));
 }
 
 function filtrarProductosPorConsulta(productos, productoSolicitado, vehiculoSolicitado) {
-    // Solo excluir años reales (4 dígitos 1900-2099) del campo vehículo
-    // Conservar números de especificación como 110, 92, etc.
     const palabrasVehiculo = prepararConsultaProducto(vehiculoSolicitado)
         .filter(palabra => !esAnioVehiculo(palabra));
     const palabrasProducto = prepararConsultaProducto(productoSolicitado)
@@ -624,7 +631,7 @@ function extraerVehiculoExplicito(texto) {
 }
 
 // ============================================================
-// DETECCIÓN DE SELECCIÓN
+// DETECCIÓN DE SELECCIÓN Y RESOLUCIÓN
 // ============================================================
 function detectarSeleccion(texto) {
     const t = sinAcentos(texto).trim();
@@ -650,9 +657,6 @@ function detectarSeleccion(texto) {
     return null;
 }
 
-// ============================================================
-// RESOLVER SELECCIÓN
-// ============================================================
 function resolverSeleccion(sesion, seleccion) {
     const productos = sesion.productos;
     if (!productos || productos.length === 0) return null;
@@ -742,14 +746,11 @@ function esMensajePropioDelNegocio(texto) {
 // ============================================================
 // BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA
 // ============================================================
-// Detecta si el texto parece un código de producto (alfanumérico compacto, sin espacios)
 function esCodigoProducto(texto) {
     const limpio = texto.trim().replace(/\s+/g, '');
-    // Código: 4-25 caracteres alfanuméricos, con al menos una letra Y al menos un dígito
     return /^[A-Z0-9]{4,25}$/i.test(limpio) && /[A-Za-z]/.test(limpio) && /\d/.test(limpio);
 }
 
-// Búsqueda directa por código de producto (sin dividir en palabras)
 async function buscarPorCodigo(texto) {
     const codigo = texto.trim().replace(/\s+/g, '').toUpperCase();
     if (codigo.length < 3) return [];
@@ -771,9 +772,6 @@ async function buscarPorCodigo(texto) {
 
 async function buscarProductos(mensajeCliente, detalleConsulta = null) {
     try {
-        // --- Prioridad 1: búsqueda directa por código ---
-        // Si el mensaje original (o el producto extraído por Gemini) parece un código,
-        // buscar primero en la columna `codigo` con el token completo sin dividir.
         const candidatosCodigo = [];
         const textosCodigo = [
             mensajeCliente,
@@ -785,7 +783,6 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
                 const resultados = await buscarPorCodigo(limpio);
                 if (resultados.length > 0) return resultados.slice(0, 5);
             }
-            // También revisar si alguna palabra individual del texto es un código
             for (const token of t.trim().split(/\s+/)) {
                 if (esCodigoProducto(token)) {
                     const resultados = await buscarPorCodigo(token);
@@ -796,21 +793,15 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
             }
         }
 
-        // --- Prioridad 2: búsqueda por palabras clave ---
         const palabras = prepararConsultaProducto(mensajeCliente);
         if (palabras.length === 0) {
-            // Si no hay palabras clave pero sí hay candidatos por código, usarlos
             return candidatosCodigo.slice(0, 5);
         }
 
-        // Solo excluir años reales del campo vehículo (4 dígitos 1900-2099)
-        // Conservar specs numéricas del producto como "110", "92", etc.
         const vehiculoFiltrado = detalleConsulta
             ? prepararConsultaProducto(detalleConsulta.vehiculo).filter(p => !esAnioVehiculo(p))
             : [];
 
-        // Para el producto: excluir palabras que ya están en vehículo y años reales
-        // Pero CONSERVAR números de especificación como 110, 92
         const palabrasRepuesto = detalleConsulta
             ? prepararConsultaProducto(detalleConsulta.producto)
                 .filter(palabra => !vehiculoFiltrado.includes(palabra) && !esAnioVehiculo(palabra))
@@ -861,7 +852,8 @@ async function buscarProductos(mensajeCliente, detalleConsulta = null) {
 }
 
 // ============================================================
-// TASA DEL DÍA// ============================================================
+// TASA DEL DÍA
+// ============================================================
 async function obtenerTasa() {
     const rows = await querySegura('SELECT tasa_dolar FROM configuracion WHERE id = 1');
     if (rows.length === 0 || Number(rows[0].tasa_dolar) <= 0) {
@@ -983,7 +975,7 @@ function crearWaMe(telefono) {
     return `https://wa.me/${String(telefono || '').replace(/\D/g, '')}`;
 }
 
-async function enviarNotificacionGerencia(sock, datos, texto, contacto) {
+async function enviarNotificacionGerencia(sock, datos, texto, contacto, msgOriginal = null) {
     const notificacion = await crearNotificacion(pool, datos);
 
     try {
@@ -992,6 +984,19 @@ async function enviarNotificacionGerencia(sock, datos, texto, contacto) {
             throw new Error('WhatsApp no devolvió el identificador del mensaje enviado.');
         }
         await registrarMensajeGerencia(pool, notificacion.id, resultado.key.id);
+
+        // REENVÍO DEL MENSAJE ORIGINAL DEL CLIENTE
+        if (msgOriginal) {
+            await new Promise(r => setTimeout(r, 1500)); // Pausa de 1.5s para no saturar
+            const forwardResult = await sock.sendMessage(contacto.jid, {
+                forward: msgOriginal,
+                contextInfo: { forwardingScore: 1, isForwarded: true }
+            });
+            if (forwardResult?.key?.id) {
+                await registrarMensajeGerencia(pool, notificacion.id, forwardResult.key.id);
+            }
+        }
+
         return notificacion.referencia;
     } catch (error) {
         await marcarNotificacionFallida(pool, notificacion.id, error.message);
@@ -1003,7 +1008,7 @@ function obtenerContactosNotificacion(tipo) {
     return obtenerContactosParaNotificacion(tipo);
 }
 
-async function enviarNotificacionContactos(sock, datos, texto, tipoContacto, referencia) {
+async function enviarNotificacionContactos(sock, datos, texto, tipoContacto, referencia, msgOriginal = null) {
     const contactos = obtenerContactosNotificacion(tipoContacto);
     const resultados = await Promise.allSettled(contactos.map((contacto) => {
         const sufijo = contacto.tipo === 'delivery' ? 'D' : 'E';
@@ -1012,7 +1017,8 @@ async function enviarNotificacionContactos(sock, datos, texto, tipoContacto, ref
             sock,
             { ...datos, referencia: refContacto },
             texto,
-            contacto
+            contacto,
+            msgOriginal
         );
     }));
     const errores = resultados
@@ -1024,7 +1030,7 @@ async function enviarNotificacionContactos(sock, datos, texto, tipoContacto, ref
     return referencia;
 }
 
-async function notificarProductoNoDisponible(sock, datosCliente, consulta) {
+async function notificarProductoNoDisponible(sock, datosCliente, consulta, msgOriginal = null) {
     return enviarNotificacionContactos(sock, {
         tipo: 'consulta',
         referencia: datosCliente.referencia,
@@ -1038,7 +1044,7 @@ async function notificarProductoNoDisponible(sock, datosCliente, consulta) {
         `👤 Cliente: ${datosCliente.nombre}`,
         `📱 Teléfono: ${datosCliente.telefono} (${crearWaMe(datosCliente.telefono)})`,
         `🛒 Consulta exacta: ${consulta}`
-    ].join('\n'), 'consulta', datosCliente.referencia);
+    ].join('\n'), 'consulta', datosCliente.referencia, msgOriginal);
 }
 
 function textoOpcionesEntrega() {
@@ -1179,7 +1185,6 @@ async function finalizarPedido(sock, jid, sesion) {
     }
 }
 
-// Convierte palabras numéricas básicas a dígito
 function palabraANumero(texto) {
     const t = sinAcentos(texto).trim().toLowerCase();
     const mapa = {
@@ -1257,7 +1262,7 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
                     nombre: sesion.nombreWhatsApp,
                     telefono: sesion.telefono,
                     referencia
-                }, texto);
+                }, texto, null);
                 await sock.sendMessage(jid, {
                     text: `No encontré disponibilidad para "${texto}". Envié la consulta a ventas. ` +
                         `Referencia: ${referencia}. Puedes buscar otro producto o responder *no*.`
@@ -1424,6 +1429,12 @@ async function procesarMensaje(sock, msg) {
     const jid = msg.key.remoteJid;
     if (!jid || esMensajeDeGrupo(jid)) return;
 
+    // NUEVO: Si el humano intervino, el bot se calla
+    if (estaEnModoHumano(jid)) {
+        console.log(`⏸️ Bot pausado para ${jid} (modo humano)`);
+        return;
+    }
+
     const mensaje = desenvolverMensaje(msg.message);
     const texto = extraerTexto(mensaje);
     const ubicacion = extraerUbicacion(msg.message);
@@ -1523,7 +1534,6 @@ async function procesarMensaje(sock, msg) {
 
     // Verificar si es selección de una lista anterior
     if (sesion && ['resultados', 'seleccion_adicional'].includes(sesion.etapa)) {
-        // Intentar detectar selección por número (dígito o palabra)
         const numPalabra = palabraANumero(texto);
         const seleccionNum = numPalabra !== null ? { tipo: 'numero', valor: numPalabra } : null;
         const seleccion = seleccionNum || detectarSeleccion(texto);
@@ -1550,7 +1560,6 @@ async function procesarMensaje(sock, msg) {
     // ============================================================
     // FLUJO PRINCIPAL: Gemini primero, fallback a la lógica tradicional
     // ============================================================
-
     if (geminiService.model) {
         let decision;
         try {
@@ -1591,7 +1600,7 @@ async function procesarMensaje(sock, msg) {
                     : [];
 
                 const tasa = await obtenerTasa();
-                const respuesta = formatearProductos(productos, tasa);
+                let respuesta = formatearProductos(productos, tasa);
                 geminiService.guardarRespuesta(jid, respuesta);
 
                 if (productos.length > 0) {
@@ -1601,8 +1610,29 @@ async function procesarMensaje(sock, msg) {
                         nombreWhatsApp: pushName,
                         telefono: numeroCliente
                     });
+                    await sock.sendMessage(jid, { text: respuesta });
+                    return;
                 }
-                await sock.sendMessage(jid, { text: respuesta });
+
+                // NUEVO: Si no hay producto, avisamos a AMBOS gerentes con el Forward
+                const referencia = `CONS-${Date.now().toString(36).toUpperCase()}`;
+                try {
+                    await notificarProductoNoDisponible(sock, {
+                        jid,
+                        nombre: pushName,
+                        telefono: numeroCliente,
+                        referencia
+                    }, consulta || texto, msg); // <-- Pasamos 'msg' para el forward
+                    
+                    respuesta = `no encontré ese repuesto en el inventario 🤔\n\n` +
+                               `Envié tu consulta al área de ventas con la referencia ${referencia}. ` +
+                               `Te responderemos por aquí en breve.\n\n` +
+                               `También puedes ver el catálogo:\n🛒 ${CONFIG.catalogo}`;
+                    await sock.sendMessage(jid, { text: respuesta });
+                } catch (error) {
+                    console.error(`No se pudo remitir la consulta ${referencia} a gerencia:`, error.message);
+                    await sock.sendMessage(jid, { text: respuesta });
+                }
                 return;
             }
 
@@ -1668,7 +1698,7 @@ async function procesarMensaje(sock, msg) {
                     nombre: pushName,
                     telefono: numeroCliente,
                     referencia
-                }, texto);
+                }, texto, msg); // <-- Pasamos 'msg' para el forward
                 await sock.sendMessage(jid, {
                     text: `No encontré disponibilidad en el inventario para "${texto}". ` +
                         'Envié tu consulta al área de ventas para verificar depósitos y proveedores. ' +
@@ -1731,6 +1761,16 @@ async function iniciarBot() {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
+            // CONTROL DEL MODO HUMANO: Si el bot (tú) envía un mensaje, pausamos las respuestas a ese cliente
+            if (msg.key.fromMe && msg.key.remoteJid && !esMensajeDeGrupo(msg.key.remoteJid)) {
+                const jid = msg.key.remoteJid;
+                if (!esJidGerencia(jid, null)) {
+                    modoHumano.set(jid, { hasta: Date.now() + MODO_HUMANO_MS });
+                    console.log(`👤 Modo humano activado para ${jid} por 10 minutos.`);
+                }
+                continue; // No procesar como mensaje entrante normal
+            }
+
             try {
                 await procesarMensaje(sock, msg);
             } catch (error) {
