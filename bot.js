@@ -39,6 +39,7 @@ const CONFIG = {
 
 const ACCIONES_GEMINI = [
     'buscar_producto',
+    'consultar_encargo',
     'saludo',
     'ubicacion',
     'agradecimiento',
@@ -55,6 +56,7 @@ Teléfono: ${CONFIG.telefono}
 
 Analiza el último mensaje junto con el historial y devuelve únicamente un objeto JSON válido que cumpla el esquema.
 Clasifica saludos puros (ej. "hola", "buenas tardes") como "saludo", preguntas sobre ubicación/dirección como "ubicacion", agradecimientos como "agradecimiento" y conversación no relacionada con una búsqueda como "conversacion_general".
+Si el cliente pregunta por el estado de un pedido/encargo ya realizado (ej. "¿ya encargaron los amortiguadores?", "¿cómo va mi pedido?", "¿llegó la pieza que mandé a pedir?"), usa "consultar_encargo". NO uses "buscar_producto" para estas consultas de seguimiento. En "producto" incluye la pieza mencionada y en "vehiculo" el vehículo si se conoce.
 
 ¡ATENCIÓN! Usa "buscar_producto" SIEMPRE que el cliente pida un repuesto, pregunte si hay disponibilidad o precio de un repuesto (como aceites, filtros, bujías, correas), o continúe una búsqueda previa. Si el mensaje contiene un repuesto o medida (ej. 15W-40, 110 dientes), NUNCA devuelvas "saludo", debes devolver "buscar_producto".
 
@@ -471,6 +473,11 @@ function normalizarFrase(texto) {
     return sinAcentos(limpiarTexto(texto)).toLowerCase();
 }
 
+function detectarConsultaEncargo(texto) {
+    const t = normalizarFrase(texto);
+    return /\b(ya\s+(?:lo\s+)?encargaron|ya\s+(?:lo\s+)?pidieron|estado\s+(?:de\s+)?(?:mi\s+)?pedido|como\s+va\s+(?:mi\s+)?pedido|como\s+va\s+(?:el\s+)?encargo|llego\s+(?:el\s+)?(?:repuesto|pedido|encargo)|cuando\s+llega|cuando\s+lo\s+traen|consulta(?:r)?\s+(?:mi\s+)?encargo)\b/i.test(t);
+}
+
 // ============================================================
 // DETECCIÓN DE INTENCIONES (fallback sin IA)
 // ============================================================
@@ -629,12 +636,30 @@ function filtrarProductosPorConsulta(productos, productoSolicitado, vehiculoSoli
 }
 
 function extraerVehiculoExplicito(texto) {
-    const coincidencia = limpiarTexto(texto)
-        .match(/\b(?:para|del carro|del vehiculo|vehiculo|carro)\s+(.+)$/i);
-    if (!coincidencia) return '';
+    const limpio = limpiarTexto(texto);
+    const marcasYModelos = [
+        'chevrolet', 'hyundai', 'kia', 'chery', 'toyota', 'ford', 'daewoo',
+        'mitsubishi', 'suzuki', 'nissan', 'honda', 'mazda', 'renault',
+        'volkswagen', 'jeep', 'dodge', 'fiat', 'spark', 'accent', 'rio',
+        'stylus', 'corsa', 'aveo', 'optra', 'elantra', 'getz', 'tucson',
+        'sportage', 'arauca', 'arauca', 'orinoco', 'matiz', 'cielo', 'lanos',
+        'picanto', 'terios', 'lancer', 'corolla', 'fiesta', 'ecosport', 'qq'
+    ].join('|');
+    const conocido = limpio.match(new RegExp(
+        `\\\\b((?:${marcasYModelos})\\\\s+[a-z0-9]+(?:\\\\s+[a-z0-9]+){0,2})`,
+        'i'
+    ));
+    if (conocido) {
+        return prepararConsultaProducto(conocido[1])
+            .filter(palabra => !esAnioVehiculo(palabra))
+            .slice(0, 4)
+            .join(' ');
+    }
 
+    const coincidencia = limpio.match(/.*\b(?:para|del carro|del vehiculo|vehiculo|carro)\s+(.+)$/i);
+    if (!coincidencia) return '';
     return prepararConsultaProducto(coincidencia[1])
-        .filter(palabra => !/^\d{2,4}$/.test(palabra))
+        .filter(palabra => !esAnioVehiculo(palabra))
         .slice(0, 4)
         .join(' ');
 }
@@ -756,8 +781,11 @@ function esMensajePropioDelNegocio(texto) {
 // BUSCAR PRODUCTOS CON COINCIDENCIA ESTRICTA Y DIFUSA
 // ============================================================
 function esCodigoProducto(texto) {
-    const limpio = texto.trim().replace(/\s+/g, '');
-    return /^[A-Z0-9]{4,25}$/i.test(limpio) && /[A-Za-z]/.test(limpio) && /\d/.test(limpio);
+    const limpio = texto.trim().replace(/[\s-]+/g, '');
+    if (!/^[A-Z0-9]{4,30}$/i.test(limpio)) return false;
+    // Acepta códigos alfanuméricos y códigos numéricos largos; excluye años de cuatro cifras.
+    return (/[A-Za-z]/.test(limpio) && /\d/.test(limpio)) ||
+        (/^\d{5,30}$/.test(limpio));
 }
 
 async function buscarPorCodigo(texto) {
@@ -779,106 +807,113 @@ async function buscarPorCodigo(texto) {
     }
 }
 
+function escaparLike(valor) {
+    return String(valor || '').replace(/[\\%_]/g, '\\$&');
+}
+
+function puntuarProducto(producto, palabrasRepuesto, palabrasVehiculo) {
+    const nombre = sinAcentos(producto.nombre_producto).toUpperCase();
+    const codigo = sinAcentos(producto.codigo).toUpperCase();
+    const marcaRepuesto = sinAcentos(producto.marca_repuesto).toUpperCase();
+    const vehiculo = sinAcentos(`${producto.marca_carro || ''} ${producto.modelo_vehiculo || ''} ${producto.ano || ''}`).toUpperCase();
+
+    let puntos = 0;
+    for (const palabra of palabrasRepuesto) {
+        const p = sinAcentos(palabra).toUpperCase();
+        if (codigo === p) puntos += 100;
+        else if (codigo.includes(p)) puntos += 25;
+        if (nombre.includes(p)) puntos += 12;
+        if (marcaRepuesto.includes(p)) puntos += 4;
+    }
+    for (const palabra of palabrasVehiculo) {
+        const p = sinAcentos(palabra).toUpperCase();
+        if (vehiculo.includes(p)) puntos += 20;
+        else return -1; // No recomendar una pieza si el vehículo explícito no coincide.
+    }
+    if (Number(producto.stock_actual) > 0) puntos += 2;
+    return puntos;
+}
+
 async function buscarProductos(mensajeCliente, detalleConsulta = null) {
     try {
-        const candidatosCodigo = [];
-        const textosCodigo = [
-            mensajeCliente,
-            detalleConsulta?.producto || ''
-        ];
-        for (const t of textosCodigo) {
-            const limpio = t.trim().replace(/\s+/g, '');
-            if (esCodigoProducto(limpio)) {
-                const resultados = await buscarPorCodigo(limpio);
-                if (resultados.length > 0) return resultados.slice(0, 5);
-            }
-            for (const token of t.trim().split(/\s+/)) {
-                if (esCodigoProducto(token)) {
-                    const resultados = await buscarPorCodigo(token);
-                    if (resultados.length > 0 && !candidatosCodigo.length) {
-                        candidatosCodigo.push(...resultados);
-                    }
-                }
-            }
+        const consultaOriginal = String(mensajeCliente || '').trim();
+        const textoProducto = String(detalleConsulta?.producto || consultaOriginal).trim();
+        const textoVehiculo = String(detalleConsulta?.vehiculo || extraerVehiculoExplicito(consultaOriginal) || '').trim();
+
+        // Un código exacto tiene prioridad, pero nunca se usa un código parcial como coincidencia exacta.
+        const codigoCandidato = [consultaOriginal, textoProducto]
+            .flatMap(t => [t.replace(/\s+/g, ''), ...t.split(/\s+/)])
+            .map(t => t.trim())
+            .find(t => esCodigoProducto(t));
+        if (codigoCandidato) {
+            const exactos = await querySegura(
+                `SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
+                        modelo_vehiculo, ano, precio, stock_actual
+                 FROM producto
+                 WHERE UPPER(REPLACE(codigo, '-', '')) = UPPER(REPLACE(?, '-', ''))
+                   AND stock_actual > 0
+                 LIMIT 5`,
+                [codigoCandidato]
+            );
+            if (exactos.length) return exactos;
         }
 
-        const palabras = prepararConsultaProducto(mensajeCliente);
-        if (palabras.length === 0) {
-            return candidatosCodigo.slice(0, 5);
+        const palabrasVehiculo = prepararConsultaProducto(textoVehiculo)
+            .filter(p => !esAnioVehiculo(p));
+        const palabrasProducto = prepararConsultaProducto(textoProducto)
+            .filter(p => !palabrasVehiculo.includes(p) && !esAnioVehiculo(p));
+
+        // No ejecutar búsquedas amplias si no se pudo identificar la pieza.
+        if (palabrasProducto.length === 0) return [];
+
+        // Candidatos por palabras del repuesto con parámetros SQL; no interpolar texto del cliente.
+        const condicionesProducto = [];
+        const parametros = [];
+        for (const palabra of palabrasProducto) {
+            const variantes = new Set([palabra, palabra.replace(/-/g, '')]);
+            if (palabra.length > 3 && palabra.endsWith('S')) variantes.add(palabra.slice(0, -1));
+            const grupo = [];
+            for (const variante of variantes) {
+                const like = `%${escaparLike(variante)}%`;
+                grupo.push('(nombre_producto LIKE ? OR codigo LIKE ? OR marca_repuesto LIKE ?)');
+                parametros.push(like, like, like);
+            }
+            condicionesProducto.push(`(${grupo.join(' OR ')})`);
         }
 
-        const vehiculoFiltrado = detalleConsulta
-            ? prepararConsultaProducto(detalleConsulta.vehiculo).filter(p => !esAnioVehiculo(p))
-            : [];
+        // Si se conoce el vehículo, cada palabra relevante debe aparecer en los campos del vehículo.
+        // No hay "búsqueda de rescate" que elimine este filtro.
+        const condicionesVehiculo = [];
+        for (const palabra of palabrasVehiculo) {
+            const like = `%${escaparLike(palabra)}%`;
+            condicionesVehiculo.push('(marca_carro LIKE ? OR modelo_vehiculo LIKE ? OR ano LIKE ?)');
+            parametros.push(like, like, like);
+        }
 
-        const palabrasRepuesto = detalleConsulta
-            ? prepararConsultaProducto(detalleConsulta.producto)
-                .filter(palabra => !vehiculoFiltrado.includes(palabra) && !esAnioVehiculo(palabra))
-            : palabras.filter(palabra => !esAnioVehiculo(palabra));
-
-        if (palabrasRepuesto.length === 0) return candidatosCodigo.slice(0, 5);
-
-        let condicionesFinales = [];
-        
-        palabrasRepuesto.forEach(palabra => {
-            const palabraLimpia = palabra.replace(/-/g, ''); // Quitar guiones (15W-40 -> 15W40)
-            let variants = [palabra, palabraLimpia];
-            
-            if (palabraLimpia.length > 3 && palabraLimpia.endsWith('S')) {
-                variants.push(palabraLimpia.slice(0, -1)); // Singular (aceites -> aceite)
-            }
-            
-            const subCondiciones = [...new Set(variants)].map(v => `nombre_producto LIKE '%${v}%' OR marca_repuesto LIKE '%${v}%' OR codigo LIKE '%${v}%'`).join(' OR ');
-            condicionesFinales.push(`(${subCondiciones})`);
-        });
-
-        vehiculoFiltrado.forEach(palabra => {
-            const palabraLimpia = palabra.replace(/-/g, '');
-            condicionesFinales.push(`(marca_carro LIKE '%${palabra}%' OR modelo_vehiculo LIKE '%${palabra}%' OR marca_carro LIKE '%${palabraLimpia}%' OR modelo_vehiculo LIKE '%${palabraLimpia}%')`);
-        });
-
+        const condiciones = [...condicionesProducto, ...condicionesVehiculo];
         const sql = `
             SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
-                   modelo_vehiculo, precio, stock_actual
+                   modelo_vehiculo, ano, precio, stock_actual
             FROM producto
-            WHERE (${condicionesFinales.join(' AND ')}) AND stock_actual > 0
-            LIMIT 100
+            WHERE ${condiciones.join(' AND ')}
+              AND stock_actual > 0
+            LIMIT 150
         `;
+        const candidatos = await querySegura(sql, parametros);
+        if (!candidatos.length) return [];
 
-        let candidatos = await querySegura(sql);
+        const filtrados = candidatos
+            .map(producto => ({
+                producto,
+                puntos: puntuarProducto(producto, palabrasProducto, palabrasVehiculo)
+            }))
+            .filter(item => item.puntos >= 0)
+            .sort((a, b) => b.puntos - a.puntos ||
+                String(a.producto.nombre_producto || '').localeCompare(String(b.producto.nombre_producto || ''), 'es'));
 
-        // Búsqueda de RESCATE si el filtro estricto (con vehículo) falló
-        if (!candidatos || candidatos.length === 0) {
-            const rescateCondiciones = palabrasRepuesto.map(palabra => {
-                const palabraLimpia = palabra.replace(/-/g, '');
-                let variants = [palabra, palabraLimpia];
-                if (palabraLimpia.length > 3 && palabraLimpia.endsWith('S')) variants.push(palabraLimpia.slice(0, -1));
-                return [...new Set(variants)].map(v => `nombre_producto LIKE '%${v}%'`).join(' OR ');
-            }).join(' AND ');
-
-            const rescateSQL = `
-                SELECT id_producto, codigo, nombre_producto, marca_repuesto, marca_carro,
-                       modelo_vehiculo, precio, stock_actual
-                FROM producto
-                WHERE (${rescateCondiciones}) AND stock_actual > 0
-                LIMIT 10
-            `;
-            const rescate = await querySegura(rescateSQL);
-            if (rescate && rescate.length > 0) return rescate.slice(0, 5);
-
-            return candidatosCodigo.slice(0, 5);
-        }
-
-        const relevantes = detalleConsulta
-            ? filtrarProductosPorConsulta(candidatos, detalleConsulta.producto, detalleConsulta.vehiculo)
-            : candidatos;
-
-        const resultadoFinal = relevantes.length > 0 ? relevantes : candidatos;
-        
-        return resultadoFinal
-            .sort((a, b) => (a.nombre_producto || '').localeCompare(b.nombre_producto || ''))
-            .slice(0, 5);
-            
+        // Si el cliente especificó un vehículo y no hay coincidencias, se devuelve vacío.
+        // Nunca se sustituyen automáticamente piezas de otro vehículo.
+        return filtrados.slice(0, 3).map(item => item.producto);
     } catch (error) {
         console.error('Error buscando productos:', error.message);
         return [];
@@ -1636,6 +1671,45 @@ async function procesarMensaje(sock, msg) {
         }
     }
 
+    // El seguimiento de encargos se detecta antes de Gemini para que nunca se convierta
+    // accidentalmente en una búsqueda de catálogo.
+    if (detectarConsultaEncargo(texto)) {
+        const referencia = `ENC-${Date.now().toString(36).toUpperCase()}`;
+        const detalle = [
+            'SEGUIMIENTO DE ENCARGO SOLICITADO POR CLIENTE',
+            `Mensaje original: ${texto}`,
+            `Pieza mencionada: ${texto}`,
+            'Acción requerida: verificar el encargo con el cliente y responder citando esta notificación.'
+        ].join('\n');
+        try {
+            await enviarNotificacionContactos(sock, {
+                tipo: 'consulta',
+                referencia,
+                clientJid: jid,
+                nombre: pushName,
+                telefono: numeroCliente,
+                detalle
+            }, [
+                '📋 SEGUIMIENTO DE ENCARGO',
+                `🏷️ Referencia: ${referencia}`,
+                `👤 Cliente: ${pushName}`,
+                `📱 Teléfono: ${numeroCliente}`,
+                `💬 Consulta: ${texto}`,
+                '',
+                'Por favor, verifica el estado real del encargo y responde citando esta notificación.'
+            ].join('\n'), 'consulta', referencia, msg);
+            await sock.sendMessage(jid, {
+                text: `Recibí tu consulta sobre el encargo. La envié a ventas para verificar el estado real.\\nReferencia: ${referencia}.\\n\\nTe responderemos por este mismo chat cuando nos confirmen la información.`
+            });
+        } catch (error) {
+            console.error(`No se pudo remitir el seguimiento ${referencia}:`, error.message);
+            await sock.sendMessage(jid, {
+                text: 'No pude comunicar la consulta a ventas en este momento. Por favor, vuelve a intentarlo o contacta directamente a la tienda.'
+            });
+        }
+        return;
+    }
+
     if (geminiService.model) {
         let decision;
         try {
@@ -1664,6 +1738,34 @@ async function procesarMensaje(sock, msg) {
                 const respuesta = decision.respuesta_texto || respuestaGracias();
                 geminiService.guardarRespuesta(jid, respuesta);
                 await sock.sendMessage(jid, { text: respuesta });
+                return;
+            }
+            if (decision.accion === 'consultar_encargo') {
+                const referencia = `ENC-${Date.now().toString(36).toUpperCase()}`;
+                try {
+                    await enviarNotificacionContactos(sock, {
+                        tipo: 'consulta',
+                        referencia,
+                        clientJid: jid,
+                        nombre: pushName,
+                        telefono: numeroCliente,
+                        detalle: `Seguimiento de encargo: ${texto}`
+                    }, [
+                        '📋 SEGUIMIENTO DE ENCARGO',
+                        `🏷️ Referencia: ${referencia}`,
+                        `👤 Cliente: ${pushName}`,
+                        `📱 Teléfono: ${numeroCliente}`,
+                        `💬 Consulta: ${texto}`,
+                        '',
+                        'Verificar estado real y responder citando esta notificación.'
+                    ].join('\\n'), 'consulta', referencia, msg);
+                    await sock.sendMessage(jid, {
+                        text: `Envié tu consulta a ventas para verificar el estado real del encargo.\\nReferencia: ${referencia}.\\nTe responderemos por este chat.`
+                    });
+                } catch (error) {
+                    console.error('Error enviando seguimiento a ventas:', error.message);
+                    await sock.sendMessage(jid, { text: 'No pude comunicar tu consulta a ventas en este momento. Intenta nuevamente más tarde.' });
+                }
                 return;
             }
             if (decision.accion === 'buscar_producto') {
@@ -1911,6 +2013,8 @@ module.exports = {
     respuestaErrorGemini,
     prepararConsultaProducto,
     filtrarProductosPorConsulta,
+    detectarConsultaEncargo,
+    esCodigoProducto,
     extraerVehiculoExplicito,
     detectarIntencion,
     detectarSeguimientoProducto,
