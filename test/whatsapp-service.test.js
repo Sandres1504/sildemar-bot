@@ -4,10 +4,15 @@ const {
     asegurarTablasWhatsApp,
     buscarNotificacionPorMensaje,
     buscarNotificacionesPendientesGerencia,
+    cancelarNotificacionesCliente,
     crearPedidoWhatsApp,
     obtenerContactosGerencia,
     obtenerContactosParaNotificacion,
-    normalizarNumeroWhatsApp
+    obtenerTelefonoDueno,
+    normalizarNumeroWhatsApp,
+    registrarFeedbackIA,
+    obtenerFeedbackIA,
+    registrarMensajeGerencia
 } = require('../whatsapp-service');
 
 test('crea las tablas auxiliares de WhatsApp si aún no existen', async () => {
@@ -18,9 +23,10 @@ test('crea las tablas auxiliares de WhatsApp si aún no existen', async () => {
         }
     });
 
-    assert.equal(statements.length, 2);
+    assert.equal(statements.length, 4);
     assert.match(statements[0], /CREATE TABLE IF NOT EXISTS whatsapp_solicitudes/);
     assert.match(statements[1], /CREATE TABLE IF NOT EXISTS whatsapp_notificaciones/);
+    assert.match(statements[3], /CREATE TABLE IF NOT EXISTS whatsapp_ia_feedback/);
 });
 
 test('normaliza los contactos locales a JID de WhatsApp con código de país', () => {
@@ -71,6 +77,11 @@ test('rechaza un contacto de gerencia inválido', () => {
     }), /no es válido/);
 });
 
+test('normalizes the optional owner phone used by administrative commands', () => {
+    assert.equal(obtenerTelefonoDueno({ OWNER_PHONE: '04121234567' }), '584121234567');
+    assert.equal(obtenerTelefonoDueno({}), null);
+});
+
 test('busca una respuesta citada solo entre las notificaciones de ese gerente', async () => {
     let consulta;
     let parametros;
@@ -86,8 +97,57 @@ test('busca una respuesta citada solo entre las notificaciones de ese gerente', 
     const resultado = await buscarNotificacionPorMensaje(pool, 'mensaje-123', 'envio');
 
     assert.equal(resultado, resultadoEsperado);
-    assert.match(consulta, /manager_message_id = \? AND referencia LIKE \?/);
+    assert.match(consulta, /m\.manager_message_id = \? AND n\.referencia LIKE \?/);
     assert.deepEqual(parametros, ['mensaje-123', '%-E']);
+});
+
+test('stores aggregate AI feedback by approved category without conversation content', async () => {
+    const calls = [];
+    const feedback = [{ categoria: 'cashea', ocurrencias: 2 }];
+    const pool = {
+        async execute(sql, params) {
+            calls.push({ sql, params });
+            return [feedback];
+        }
+    };
+
+    await registrarFeedbackIA(pool, 'cashea');
+    assert.deepEqual(await obtenerFeedbackIA(pool), feedback);
+    assert.match(calls[0].sql, /ocurrencias = ocurrencias \+ 1/);
+    assert.deepEqual(calls[0].params, ['cashea']);
+    await assert.rejects(registrarFeedbackIA(pool, 'texto-libre'), /categoría.*no es válida/i);
+});
+
+test('cancels outstanding sales notifications after a client requests no contact', async () => {
+    let sql;
+    let params;
+    const cantidadCancelada = await cancelarNotificacionesCliente({
+        async execute(statement, values) {
+            sql = statement;
+            params = values;
+            return [{ affectedRows: 2 }];
+        }
+    }, 'cliente@s.whatsapp.net');
+
+    assert.equal(cantidadCancelada, 2);
+    assert.match(sql, /estado IN \('pendiente', 'enviada'\)/);
+    assert.deepEqual(params, ['cliente@s.whatsapp.net']);
+});
+
+test('does not reopen cancelled notifications when registering the manager message', async () => {
+    let statement;
+    const calls = [];
+    const registered = await registrarMensajeGerencia({
+        async execute(sql) {
+            calls.push(sql);
+            statement = sql;
+            return [{ affectedRows: 0 }];
+        }
+    }, 7, 'manager-message');
+
+    assert.equal(registered, false);
+    assert.match(statement, /estado IN \('pendiente', 'enviada'\)/);
+    assert.equal(calls.length, 1);
 });
 
 test('solo usa una respuesta sin cita cuando el gerente tiene una notificación pendiente', async () => {

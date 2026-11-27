@@ -30,6 +30,8 @@ const TELEFONOS_GERENCIA_PREDETERMINADOS = {
     envio: '04142522920'
 };
 
+const CATEGORIAS_FEEDBACK_IA = ['cashea', 'cierre', 'inventario', 'respeto'];
+
 function obtenerContactosGerencia(environment = process.env) {
     const delivery = normalizarNumeroWhatsApp(
         environment.GERENTE_DELIVERY_PHONE || TELEFONOS_GERENCIA_PREDETERMINADOS.delivery
@@ -48,6 +50,11 @@ function obtenerContactosParaNotificacion(tipo, environment = process.env) {
     if (tipo === 'pedido') return [contactos.delivery];
     if (tipo === 'envio') return [contactos.envio];
     return [contactos.delivery, contactos.envio]; // Para 'consulta', envía a ambos
+}
+
+function obtenerTelefonoDueno(environment = process.env) {
+    const telefono = String(environment.OWNER_PHONE || '').trim();
+    return telefono ? normalizarNumeroWhatsApp(telefono) : null;
 }
 
 async function asegurarTablasWhatsApp(pool) {
@@ -95,6 +102,36 @@ async function asegurarTablasWhatsApp(pool) {
             KEY idx_notif (id_notificacion)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+    await pool.execute(`
+        CREATE TABLE IF NOT EXISTS whatsapp_ia_feedback (
+            categoria VARCHAR(32) NOT NULL PRIMARY KEY,
+            ocurrencias INT UNSIGNED NOT NULL DEFAULT 1,
+            actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+}
+
+async function registrarFeedbackIA(pool, categoria) {
+    if (!CATEGORIAS_FEEDBACK_IA.includes(categoria)) {
+        throw new Error('La categoría de corrección de IA no es válida.');
+    }
+
+    await pool.execute(
+        `INSERT INTO whatsapp_ia_feedback (categoria, ocurrencias)
+         VALUES (?, 1)
+         ON DUPLICATE KEY UPDATE ocurrencias = ocurrencias + 1`,
+        [categoria]
+    );
+}
+
+async function obtenerFeedbackIA(pool) {
+    const [rows] = await pool.execute(
+        `SELECT categoria, ocurrencias
+         FROM whatsapp_ia_feedback
+         ORDER BY actualizado_en DESC`
+    );
+    return rows;
 }
 
 async function buscarPersonaCliente(conn, telefono, cedula = null, lock = false) {
@@ -353,20 +390,20 @@ async function crearNotificacion(pool, {
 }
 
 async function registrarMensajeGerencia(pool, idNotificacion, messageId) {
-    // Actualiza el estado de la notificación principal
-    await pool.execute(
+    const [result] = await pool.execute(
         `UPDATE whatsapp_notificaciones
          SET manager_message_id = ?, estado = 'enviada'
-         WHERE id = ?`,
+         WHERE id = ? AND estado IN ('pendiente', 'enviada')`,
         [messageId, idNotificacion]
     );
-    
-    // Guarda el ID en la tabla de mensajes para poder buscarlo luego
+    if (result.affectedRows !== 1) return false;
+
     await pool.execute(
         `INSERT IGNORE INTO whatsapp_notificacion_mensajes (id_notificacion, manager_message_id)
          VALUES (?, ?)`,
         [idNotificacion, messageId]
     );
+    return true;
 }
 
 async function marcarNotificacionFallida(pool, idNotificacion, errorMessage) {
@@ -414,6 +451,16 @@ async function registrarRespuestaGerencia(pool, idNotificacion, respuesta) {
     return result.affectedRows === 1;
 }
 
+async function cancelarNotificacionesCliente(pool, clientJid) {
+    const [result] = await pool.execute(
+        `UPDATE whatsapp_notificaciones
+         SET estado = 'cancelada'
+         WHERE client_jid = ? AND estado IN ('pendiente', 'enviada')`,
+        [clientJid]
+    );
+    return result.affectedRows;
+}
+
 module.exports = {
     asegurarTablasWhatsApp,
     buscarClientePorTelefono,
@@ -423,8 +470,13 @@ module.exports = {
     crearPedidoWhatsApp,
     obtenerContactosGerencia,
     obtenerContactosParaNotificacion,
+    obtenerTelefonoDueno,
     normalizarNumeroWhatsApp,
     marcarNotificacionFallida,
     registrarMensajeGerencia,
-    registrarRespuestaGerencia
+    registrarRespuestaGerencia,
+    registrarFeedbackIA,
+    obtenerFeedbackIA,
+    CATEGORIAS_FEEDBACK_IA,
+    cancelarNotificacionesCliente
 };
