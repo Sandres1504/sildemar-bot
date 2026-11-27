@@ -552,8 +552,28 @@ function detectarConsultaCashea(texto) {
 
 function respuestaCashea() {
     return `Sí, aceptamos Cashea. ${describirCondicionesCashea()}\n\n` +
-        `Puedes ver nuestro perfil en Cashea aquí: ${CONFIG_CASHEA.perfil}\n\n` +
-        '¿Qué repuesto buscas y cuál es tu nivel? Ventas validará la aplicación concreta antes de confirmar el pedido.';
+        `Perfil de Sildemar: ${CONFIG_CASHEA.perfil}\n\n` +
+        'Si quieres usar Cashea para un pedido, dime el repuesto y tu nivel. La aplicación se valida con ventas antes de confirmar.';
+}
+
+function describirPagoCashea(total, nivel) {
+    const inicial = CONFIG_CASHEA.inicialPorNivel[nivel];
+    const montoInicial = Number(total) * inicial / 100;
+    return `Cashea · nivel ${nivel} · inicial ${inicial}% ($${montoInicial.toFixed(2)}) · ` +
+        `${CONFIG_CASHEA.cuotas} cuotas. Aplicación pendiente de validación por ventas.`;
+}
+
+function obtenerTotalCarrito(sesion) {
+    return sesion.carrito.reduce((suma, item) => suma + item.precio * item.cantidad, 0);
+}
+
+function cumpleMontoMinimoCashea(total) {
+    return Number.isFinite(Number(total)) && Number(total) >= CONFIG_CASHEA.montoMinimo;
+}
+
+function detectarNivelCashea(texto) {
+    const match = normalizarFrase(texto).match(/^(?:(?:mi\s+)?nivel\s+|nivel\s+)?([1-6])$/);
+    return match ? Number(match[1]) : null;
 }
 
 function detectarSolicitudNoContacto(texto) {
@@ -570,6 +590,12 @@ function detectarDudaCompra(texto) {
         return 'pausa';
     }
     return null;
+}
+
+function respuestaGerenciaEsAmbigua(texto) {
+    return /^(?:confirmar|confirmado|confirmada|ok|listo)$/i.test(
+        normalizarFrase(texto)
+    );
 }
 
 // ============================================================
@@ -1258,6 +1284,7 @@ function crearFichaDespacho(pedido, referencia) {
     const listaProductos = pedido.detalles.map((producto) =>
         `• ${producto.nombre_producto} (${producto.codigo || `ID ${producto.id_producto}`}) x ${producto.cantidad}`
     ).join('\n');
+    const total = pedido.total;
 
     let entregaTexto;
     if (pedido.metodoEntrega === 'Retiro en Local') {
@@ -1283,6 +1310,11 @@ function crearFichaDespacho(pedido, referencia) {
         `📲 WhatsApp: ${crearWaMe(pedido.telefono)}`,
         `🛒 Productos solicitados:\n${listaProductos}`,
         `💵 Total: $${pedido.total.toFixed(2)}`,
+        ...(pedido.nivelCashea ? [
+            `💳 Pago solicitado: Cashea, nivel ${pedido.nivelCashea}. ${describirPagoCashea(total, pedido.nivelCashea)}`,
+            'Validar la aplicación con Cashea; el pedido aún no representa aprobación ni pago recibido.',
+            'Si respondes a esta ficha, escribe el mensaje completo para el cliente. No respondas solo “Confirmar”; tu texto se reenvía literalmente.'
+        ] : []),
         `🚚 Método de entrega: ${pedido.metodoEntrega}`,
         `📍 Ubicación / Datos de envío:\n${entregaTexto}`
     ].join('\n\n');
@@ -1295,6 +1327,7 @@ async function solicitarConfirmacionPedido(sock, jid, sesion) {
     const productos = sesion.carrito.map((item) =>
         `• ${item.nombre_producto} x ${item.cantidad} ($${(item.precio * item.cantidad).toFixed(2)})`
     ).join('\n');
+    const total = obtenerTotalCarrito(sesion);
 
     let entregaTexto;
     if (sesion.metodoEntrega === 'Retiro en Local') {
@@ -1307,7 +1340,11 @@ async function solicitarConfirmacionPedido(sock, jid, sesion) {
 
     await sock.sendMessage(jid, {
         text: `Revisa tu pedido:\n${productos}\n\n` +
+            `💵 Total: $${total.toFixed(2)}\n` +
             `🚚 ${sesion.metodoEntrega}: ${entregaTexto}\n\n` +
+            (sesion.nivelCashea
+                ? `💳 ${describirPagoCashea(total, sesion.nivelCashea)}\n\n`
+                : '💳 Pago: por definir al confirmar con ventas.\n\n') +
             'Responde *CONFIRMAR* para registrar el pedido o *CANCELAR* para descartarlo. ' +
             'El inventario y los precios se validarán al confirmar.'
     });
@@ -1322,6 +1359,7 @@ async function finalizarPedido(sock, jid, sesion) {
         metodoEntrega: sesion.metodoEntrega,
         datosEntrega: sesion.datosEntrega
     });
+    pedido.nivelCashea = sesion.nivelCashea || null;
     limpiarSesion(jid);
 
     try {
@@ -1333,7 +1371,9 @@ async function finalizarPedido(sock, jid, sesion) {
             telefono: pedido.telefono,
             detalle: JSON.stringify({
                 metodoEntrega: pedido.metodoEntrega,
-                datosEntrega: pedido.datosEntrega
+                datosEntrega: pedido.datosEntrega,
+                metodoPago: sesion.nivelCashea ? 'Cashea' : null,
+                nivelCashea: sesion.nivelCashea || null
             })
         }, crearFichaDespacho(pedido, pedido.codigo),
         pedido.metodoEntrega === 'Delivery Local' ? 'pedido' : 'envio',
@@ -1342,6 +1382,9 @@ async function finalizarPedido(sock, jid, sesion) {
         await sock.sendMessage(jid, {
             text: `✅ Pedido ${pedido.codigo} registrado y enviado a gerencia para coordinar el despacho.\n` +
                 `🚚 Entrega: ${pedido.metodoEntrega}.\n` +
+                (sesion.nivelCashea
+                    ? `💳 Pago solicitado: Cashea, nivel ${sesion.nivelCashea}. La aplicación queda pendiente de validación por ventas; este mensaje no confirma aprobación ni pago.\n`
+                    : '') +
                 `Referencia: ${referencia}.`
         });
     } catch (error) {
@@ -1354,7 +1397,9 @@ async function finalizarPedido(sock, jid, sesion) {
 }
 
 function palabraANumero(texto) {
-    const t = sinAcentos(texto).trim().toLowerCase();
+    let t = sinAcentos(texto).trim().toLowerCase();
+    t = t.replace(/^(?:quiero|necesito|deseo|me llevo|me llevaria|dame|serian|seria|llevo)\s+/, '');
+    t = t.replace(/\s+(?:unidades?|piezas?)$/, '');
     const mapa = {
         'uno': 1, 'primero': 1, 'primera': 1,
         'dos': 2, 'segundo': 2, 'segunda': 2,
@@ -1466,6 +1511,31 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
                 text: 'Responde *CONFIRMAR* para registrar el pedido o *CANCELAR* para descartarlo.'
             });
         }
+        return true;
+    }
+
+    if (sesion.etapa === 'cashea_nivel') {
+        const respuesta = normalizarFrase(texto);
+        if (['otro pago', 'sin cashea', 'no cashea'].includes(respuesta)) {
+            delete sesion.nivelCashea;
+            await solicitarConfirmacionPedido(sock, jid, sesion);
+            return true;
+        }
+
+        const nivel = detectarNivelCashea(texto);
+        if (!nivel) {
+            await sock.sendMessage(jid, {
+                text: respuesta === 'confirmar'
+                    ? 'Para registrar el pedido con Cashea necesito tu nivel (1–6). ' +
+                        'Responde con el nivel, escribe *OTRO PAGO* para seguir sin Cashea o *CANCELAR* para detenerlo. Aún no se ha registrado.'
+                    : `El pedido en curso ya incluye ${sesion.carrito.map((item) => item.nombre_producto).join(', ')}. ` +
+                        'Para usar Cashea, indica tu nivel del 1 al 6. También puedes escribir *OTRO PAGO* o *CANCELAR*.'
+            });
+            return true;
+        }
+
+        sesion.nivelCashea = nivel;
+        await solicitarConfirmacionPedido(sock, jid, sesion);
         return true;
     }
 
@@ -1716,6 +1786,14 @@ async function procesarMensaje(sock, msg) {
                 return;
             }
 
+            if (respuestaGerenciaEsAmbigua(texto)) {
+                await sock.sendMessage(jid, {
+                    text: 'No reenvié esa respuesta porque “Confirmar” por sí solo no explica al cliente qué se validó. ' +
+                        'Escribe el mensaje completo que debe recibir; la respuesta se enviará literalmente.'
+                });
+                return;
+            }
+
             await sock.sendMessage(notificacion.client_jid, {
                 text: texto.trim()
             });
@@ -1778,32 +1856,31 @@ async function procesarMensaje(sock, msg) {
     }
 
     if (detectarConsultaCashea(texto)) {
-        const referencia = `CAS-${Date.now().toString(36).toUpperCase()}`;
-        try {
-            await enviarNotificacionContactos(sock, {
-                tipo: 'consulta',
-                referencia,
-                clientJid: jid,
-                nombre: pushName,
-                telefono: numeroCliente,
-                detalle: `Validar el nivel del cliente y la aplicación de las condiciones confirmadas: ${describirCondicionesCashea()}`
-            }, [
-                '💳 CONSULTA SOBRE CASHEA',
-                `🏷️ Referencia: ${referencia}`,
-                `👤 Cliente: ${pushName}`,
-                `📱 Teléfono: ${numeroCliente}`,
-                `📋 Condiciones: ${describirCondicionesCashea()}`,
-                '',
-                'Confirma el nivel y que la compra cumpla el monto mínimo antes de registrar el pedido.'
-            ].join('\n'), 'consulta', referencia);
+        if (sesion?.etapa === 'confirmar_pedido') {
+            const total = obtenerTotalCarrito(sesion);
+            if (!cumpleMontoMinimoCashea(total)) {
+                await sock.sendMessage(jid, {
+                    text: `El total actual es $${total.toFixed(2)} y no llega al mínimo de $${CONFIG_CASHEA.montoMinimo} para Cashea. ` +
+                        'Puedes confirmar el pedido con otra forma de pago o escribir *CANCELAR*. No se ha registrado todavía.'
+                });
+                return;
+            }
+            sesion.etapa = 'cashea_nivel';
+            guardarSesion(jid, sesion);
             await sock.sendMessage(jid, {
-                text: `${respuestaCashea()}\nReferencia: ${referencia}`
+                text: `${describirCondicionesCashea()}\n\n` +
+                    'Para incluir Cashea en este pedido, responde con tu nivel (1–6). ' +
+                    'Escribe *OTRO PAGO* si prefieres seguir sin Cashea. Después te mostraré el resumen actualizado; ' +
+                    'el pedido no se registrará hasta que respondas *CONFIRMAR*. ' +
+                    `Perfil: ${CONFIG_CASHEA.perfil}`
             });
-        } catch (error) {
-            console.error(`No se pudo verificar Cashea para ${referencia}:`, error.message);
+        } else if (sesion) {
             await sock.sendMessage(jid, {
-                text: `${respuestaCashea()}\n\nNo pude pasar tu consulta a ventas ahora; su validación seguirá siendo necesaria antes de confirmar el pedido.`
+                text: `${respuestaCashea()}\n\n` +
+                    'Seguimos con el paso pendiente del pedido. Respóndeme ese dato y, al revisar el resumen final, podrás elegir Cashea.'
             });
+        } else {
+            await sock.sendMessage(jid, respuestaCashea());
         }
         return;
     }
@@ -2218,6 +2295,13 @@ module.exports = {
     extraerVehiculoExplicito,
     detectarIntencion,
     detectarSeguimientoProducto,
+    palabraANumero,
+    detectarNivelCashea,
+    describirPagoCashea,
+    obtenerTotalCarrito,
+    cumpleMontoMinimoCashea,
+    respuestaGerenciaEsAmbigua,
+    procesarFlujoPedido,
     respuestaUbicacion,
     respuestaSaludo,
     respuestaGracias,

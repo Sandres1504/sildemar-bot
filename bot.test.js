@@ -8,8 +8,43 @@ const {
     detectarConsultaCashea,
     respuestaCashea,
     detectarSolicitudNoContacto,
-    detectarDudaCompra
+    detectarDudaCompra,
+    detectarNivelCashea,
+    describirPagoCashea,
+    obtenerTotalCarrito,
+    cumpleMontoMinimoCashea,
+    palabraANumero,
+    respuestaGerenciaEsAmbigua,
+    procesarFlujoPedido
 } = require('./bot');
+
+test('Cashea asks for a level and then shows a clear final confirmation for the active order', async () => {
+    const sentMessages = [];
+    const sock = {
+        async sendMessage(jid, message) {
+            sentMessages.push({ jid, ...message });
+        }
+    };
+    const sesion = {
+        etapa: 'cashea_nivel',
+        carrito: [{ nombre_producto: 'Muñón Corsa', cantidad: 2, precio: 20 }],
+        metodoEntrega: 'Retiro en Local',
+        datosEntrega: {}
+    };
+
+    await procesarFlujoPedido(sock, 'cliente-3', 'Confirmar', null, sesion);
+    assert.equal(sesion.etapa, 'cashea_nivel');
+    assert.match(sentMessages[0].text, /necesito tu nivel/);
+    assert.match(sentMessages[0].text, /OTRO PAGO/);
+    assert.match(sentMessages[0].text, /Aún no se ha registrado/);
+
+    await procesarFlujoPedido(sock, 'cliente-3', '2', null, sesion);
+    assert.equal(sesion.etapa, 'confirmar_pedido');
+    assert.match(sentMessages[1].text, /Muñón Corsa/);
+    assert.match(sentMessages[1].text, /Total: \$40\.00/);
+    assert.match(sentMessages[1].text, /Cashea.*nivel 2.*inicial 50% \(\$20\.00\)/);
+    assert.match(sentMessages[1].text, /Responde \*CONFIRMAR\*/);
+});
 
 test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
     assert.equal(detectarConsultaCashea('¿Puedo pagar con Cashea?'), true);
@@ -23,6 +58,21 @@ test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
     assert.equal(detectarDudaCompra('Lo veo después'), 'pausa');
     assert.equal(detectarDudaCompra('No gracias'), 'rechazo');
     assert.equal(detectarDudaCompra('¿Cuánto cuesta?'), null);
+    assert.equal(detectarNivelCashea('mi nivel 2'), 2);
+    assert.equal(detectarNivelCashea('7'), null);
+    assert.match(describirPagoCashea(40, 2), /inicial 50% \(\$20\.00\)/);
+    assert.equal(obtenerTotalCarrito({ carrito: [{ precio: 20, cantidad: 2 }] }), 40);
+    assert.equal(cumpleMontoMinimoCashea(24.99), false);
+    assert.equal(cumpleMontoMinimoCashea(25), true);
+    assert.equal(respuestaGerenciaEsAmbigua('Confirmar'), true);
+    assert.equal(respuestaGerenciaEsAmbigua('Cashea validado para nivel 2.'), false);
+});
+
+test('accepts natural quantity phrasing without misreading longer messages', () => {
+    assert.equal(palabraANumero('Quiero 3'), 3);
+    assert.equal(palabraANumero('Necesito dos unidades'), 2);
+    assert.equal(palabraANumero('opción 4'), 4);
+    assert.equal(palabraANumero('quiero 3 filtros'), null);
 });
 
 test('adds only predefined, customer-data-free human corrections to Gemini guidance', () => {

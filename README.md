@@ -101,9 +101,11 @@ Después de guardar, haz un **Manual Deploy** o espera al redeploy automático.
    la solicitud y notifica a gerencia.
 6. Si Gemini falla o no está configurada, el bot cae al flujo tradicional de
    detección de intenciones por expresiones regulares.
-7. Las preguntas sobre Cashea se remiten a ventas para validar su aplicación al
-   pedido antes de confirmarlo. Ante una duda de compra, el bot ofrece ayuda sin insistir y
-   respeta un rechazo o una solicitud de no contacto.
+7. Si el cliente elige Cashea desde el resumen del pedido, el bot solicita el
+   nivel, vuelve a mostrar el total e inicial estimada y no registra el pedido
+   hasta una confirmación explícita. Ventas recibe el método y nivel para validar
+   su aplicación. Ante una duda, el bot ofrece ayuda sin insistir y respeta un
+   rechazo o una solicitud de no contacto.
 
 ### Correcciones supervisadas de Gemini
 
