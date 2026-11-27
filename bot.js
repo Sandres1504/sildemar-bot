@@ -42,6 +42,7 @@ const CONFIG = {
 };
 
 const CONFIG_CASHEA = {
+    perfil: 'https://mobile.cashea.app/merchants/ffaba67b-db15-47eb-b9eb-cc1fdf769542',
     montoMinimo: 25,
     cuotas: 3,
     inicialPorNivel: {
@@ -551,6 +552,7 @@ function detectarConsultaCashea(texto) {
 
 function respuestaCashea() {
     return `Sí, aceptamos Cashea. ${describirCondicionesCashea()}\n\n` +
+        `Puedes ver nuestro perfil en Cashea aquí: ${CONFIG_CASHEA.perfil}\n\n` +
         '¿Qué repuesto buscas y cuál es tu nivel? Ventas validará la aplicación concreta antes de confirmar el pedido.';
 }
 

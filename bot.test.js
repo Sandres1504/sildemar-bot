@@ -17,6 +17,7 @@ test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
     assert.match(respuestaCashea(), /mínimo es \$25/);
     assert.match(respuestaCashea(), /3 cuotas/);
     assert.match(respuestaCashea(), /60% para nivel 1, 50% para nivel 2 y 40% para niveles 3 al 6/);
+    assert.match(respuestaCashea(), /https:\/\/mobile\.cashea\.app\/merchants\/ffaba67b-db15-47eb-b9eb-cc1fdf769542/);
     assert.equal(detectarSolicitudNoContacto('No me escribas más, por favor'), true);
     assert.equal(detectarSolicitudNoContacto('Lo voy a pensar'), false);
     assert.equal(detectarDudaCompra('Lo veo después'), 'pausa');

@@ -18,7 +18,8 @@ detección de intenciones como respaldo.
   disponibilidad. La gerencia puede responder citando la notificación original.
 - **Cashea**: informa el mínimo de $25, tres cuotas y la inicial confirmada por
   nivel (60% nivel 1, 50% nivel 2 y 40% niveles 3–6). Ventas valida la aplicación
-  al pedido antes de confirmarlo; el bot no procesa pagos ni promete aprobación.
+  al pedido antes de confirmarlo; comparte el [perfil de Sildemar en Cashea](https://mobile.cashea.app/merchants/ffaba67b-db15-47eb-b9eb-cc1fdf769542).
+  El bot no procesa pagos ni promete aprobación.
 - **Corrección supervisada de IA**: el dueño puede registrar categorías de error
   para reforzar las instrucciones de Gemini. Solo se guardan categorías y
   contadores; no se guardan conversaciones ni datos de clientes para este fin.
