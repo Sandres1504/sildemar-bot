@@ -12,14 +12,17 @@ detección de intenciones como respaldo.
   intercambios durante 30 minutos) y devuelve respuestas amables.
 - **Búsqueda en inventario**: consulta MySQL por FULLTEXT y como respaldo por
   LIKE. Los precios y el stock siempre vienen del inventario real, nunca de la IA.
-- **Flujo de pedidos por etapas**: selección → cantidad → identidad → método de
-  entrega (Delivery Local / Envío Nacional) → confirmación → notificación a gerencia.
+- **Flujo de pedidos supervisado**: selección por número, código o marca → cantidad →
+  identidad → entrega → método de pago → aprobación de gerencia → confirmación
+  del cliente → registro y reserva de inventario.
 - **Notificaciones a gerencia**: fichas de despacho y consultas de productos sin
   disponibilidad. La gerencia puede responder citando la notificación original.
 - **Cashea**: informa el mínimo de $25, tres cuotas y la inicial confirmada por
   nivel (60% nivel 1, 50% nivel 2 y 40% niveles 3–6). Ventas valida la aplicación
   al pedido antes de confirmarlo; comparte el [perfil de Sildemar en Cashea](https://mobile.cashea.app/merchants/ffaba67b-db15-47eb-b9eb-cc1fdf769542).
   El bot no procesa pagos ni promete aprobación.
+- **Métodos de pago**: Cashea, efectivo, divisa (USD), pago móvil y transferencia.
+  Zelle no se ofrece como método.
 - **Corrección supervisada de IA**: el dueño puede registrar categorías de error
   para reforzar las instrucciones de Gemini. Solo se guardan categorías y
   contadores; no se guardan conversaciones ni datos de clientes para este fin.
@@ -68,8 +71,9 @@ detección de intenciones como respaldo.
 Al iniciar, el bot crea las tablas auxiliares `whatsapp_solicitudes` y
 `whatsapp_notificaciones`, `whatsapp_notificacion_mensajes` y
 `whatsapp_ia_feedback` si no existen. El usuario MySQL de Render necesita
-permiso `CREATE` en la base de datos. Si la política de cPanel no permite ese
-permiso, un administrador puede importar
+permisos `CREATE` y `ALTER` en la base de datos; `ALTER` se usa una sola vez
+para añadir el método de pago a instalaciones existentes. Si la política de cPanel no permite esos
+permisos, un administrador puede importar
 [`../backend/sql/whatsapp_integration.sql`](../backend/sql/whatsapp_integration.sql)
 una vez; luego el bot solo necesita permisos de lectura/escritura habituales.
 
@@ -97,15 +101,16 @@ Después de guardar, haz un **Manual Deploy** o espera al redeploy automático.
 3. Si la acción es `buscar_producto`, el bot consulta MySQL y responde con
    precios y stock reales.
 4. Si el cliente selecciona un producto, se inicia el flujo de pedido por etapas.
-5. Al confirmar, el bot reserva stock en MySQL dentro de una transacción, crea
-   la solicitud y notifica a gerencia.
-6. Si Gemini falla o no está configurada, el bot cae al flujo tradicional de
+5. El cliente selecciona la entrega y el pago. Gerencia verifica la solicitud
+   y responde citando la ficha con `APROBAR` o `RECHAZAR: motivo`.
+6. Si gerencia aprueba, el bot devuelve el resumen al cliente. Solo al responder
+   `CONFIRMAR` se vuelve a validar el inventario y se crea la solicitud en una
+   transacción que exige esa aprobación. El método de pago no se considera pagado.
+7. Si Gemini falla o no está configurada, el bot cae al flujo tradicional de
    detección de intenciones por expresiones regulares.
-7. Si el cliente elige Cashea desde el resumen del pedido, el bot solicita el
-   nivel, vuelve a mostrar el total e inicial estimada y no registra el pedido
-   hasta una confirmación explícita. Ventas recibe el método y nivel para validar
-   su aplicación. Ante una duda, el bot ofrece ayuda sin insistir y respeta un
-   rechazo o una solicitud de no contacto.
+8. Para Cashea, el bot solicita el nivel antes de enviar la solicitud a gerencia
+   y muestra la inicial estimada en la revisión final. Ante una duda, el bot
+   ofrece ayuda sin insistir y respeta un rechazo o una solicitud de no contacto.
 
 ### Correcciones supervisadas de Gemini
 

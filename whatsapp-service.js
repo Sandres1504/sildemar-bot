@@ -31,6 +31,13 @@ const TELEFONOS_GERENCIA_PREDETERMINADOS = {
 };
 
 const CATEGORIAS_FEEDBACK_IA = ['cashea', 'cierre', 'inventario', 'respeto'];
+const METODOS_PAGO = ['Cashea', 'Efectivo', 'Divisa (USD)', 'Pago móvil', 'Transferencia'];
+
+function errorPreaprobacionDesactualizada(mensaje) {
+    const error = new Error(mensaje);
+    error.code = 'PREAPROBACION_DESACTUALIZADA';
+    return error;
+}
 
 function obtenerContactosGerencia(environment = process.env) {
     const delivery = normalizarNumeroWhatsApp(
@@ -64,6 +71,7 @@ async function asegurarTablasWhatsApp(pool) {
             origen VARCHAR(32) NOT NULL DEFAULT 'whatsapp',
             telefono_cliente VARCHAR(32) NOT NULL,
             metodo_entrega VARCHAR(40) NOT NULL,
+            metodo_pago VARCHAR(32) NULL,
             datos_entrega LONGTEXT NOT NULL,
             creado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             KEY idx_whatsapp_solicitudes_creado (creado_en),
@@ -110,6 +118,18 @@ async function asegurarTablasWhatsApp(pool) {
                 ON UPDATE CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+
+    const [paymentMethodColumn] = await pool.execute(
+        `SELECT 1 FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'whatsapp_solicitudes'
+           AND COLUMN_NAME = 'metodo_pago'`
+    );
+    if (paymentMethodColumn.length === 0) {
+        await pool.execute(
+            'ALTER TABLE whatsapp_solicitudes ADD COLUMN metodo_pago VARCHAR(32) NULL AFTER metodo_entrega'
+        );
+    }
 }
 
 async function registrarFeedbackIA(pool, categoria) {
@@ -167,7 +187,17 @@ async function buscarClientePorTelefono(pool, telefono) {
     }
 }
 
-async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, metodoEntrega, datosEntrega }) {
+async function crearPedidoWhatsApp(pool, {
+    telefono,
+    nombre,
+    cedula,
+    carrito,
+    metodoEntrega,
+    metodoPago,
+    nivelCashea = null,
+    datosEntrega,
+    preaprobacionId = null
+}) {
     if (!Array.isArray(carrito) || carrito.length === 0) {
         throw new Error('El pedido no contiene productos.');
     }
@@ -176,6 +206,12 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
     }
     if (!['Retiro en Local', 'Delivery Local', 'Envío Nacional'].includes(metodoEntrega)) {
         throw new Error('El método de entrega no es válido.');
+    }
+    if (!METODOS_PAGO.includes(metodoPago)) {
+        throw new Error('El método de pago no es válido.');
+    }
+    if (!Number.isSafeInteger(Number(preaprobacionId)) || Number(preaprobacionId) <= 0) {
+        throw new Error('Se requiere una preaprobación vigente de gerencia para registrar el pedido.');
     }
     if (metodoEntrega === 'Delivery Local' &&
         !datosEntrega?.ubicacion && !String(datosEntrega?.direccion || '').trim()) {
@@ -194,6 +230,51 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
     try {
         await conn.beginTransaction();
         transaccionIniciada = true;
+
+        const [claim] = await conn.execute(
+            `UPDATE whatsapp_notificaciones
+             SET estado = 'registrando'
+             WHERE id = ? AND tipo = 'prepedido' AND estado = 'aprobada'`,
+            [preaprobacionId]
+        );
+        if (claim.affectedRows !== 1) {
+            throw new Error('La solicitud requiere aprobación vigente de gerencia antes de registrarse.');
+        }
+        const [preaprobaciones] = await conn.execute(
+            `SELECT detalle FROM whatsapp_notificaciones
+             WHERE id = ? AND estado = 'registrando'
+             FOR UPDATE`,
+            [preaprobacionId]
+        );
+        let aprobada;
+        try {
+            aprobada = JSON.parse(preaprobaciones[0]?.detalle || '');
+        } catch {
+            throw new Error('No se pudo leer el detalle aprobado del pedido.');
+        }
+        if (!aprobada || aprobada.metodoEntrega !== metodoEntrega ||
+            aprobada.metodoPago !== metodoPago ||
+            Number(aprobada.nivelCashea || 0) !== Number(nivelCashea || 0)) {
+            throw errorPreaprobacionDesactualizada(
+                'La entrega o forma de pago ya no coincide con lo aprobado por gerencia.'
+            );
+        }
+        const cantidadesAprobadas = new Map();
+        for (const item of aprobada.carrito || []) {
+            const id = Number(item.id_producto);
+            const cantidad = Number(item.cantidad);
+            const precio = Number(item.precio);
+            const existente = cantidadesAprobadas.get(id);
+            if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(cantidad) || cantidad <= 0 ||
+                !Number.isFinite(precio) ||
+                (existente && Math.round(existente.precio * 100) !== Math.round(precio * 100))) {
+                throw errorPreaprobacionDesactualizada('El carrito aprobado ya no es válido.');
+            }
+            cantidadesAprobadas.set(id, {
+                cantidad: (existente?.cantidad || 0) + cantidad,
+                precio
+            });
+        }
 
         let persona = await buscarPersonaCliente(conn, telefono, cedula, true);
         let idCliente;
@@ -268,9 +349,15 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
         for (const [id, cantidad] of cantidades) {
             const producto = porId.get(id);
             if (!producto) {
+                if (preaprobacionId !== null) {
+                    throw errorPreaprobacionDesactualizada(`El producto con ID ${id} ya no está disponible.`);
+                }
                 throw new Error(`El producto con ID ${id} ya no está disponible.`);
             }
             if (Number(producto.stock_actual) < cantidad) {
+                if (preaprobacionId !== null) {
+                    throw errorPreaprobacionDesactualizada(`El stock de ${producto.nombre_producto} cambió desde su aprobación.`);
+                }
                 throw new Error(`Stock insuficiente para ${producto.nombre_producto}.`);
             }
 
@@ -278,9 +365,23 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
             if (!Number.isFinite(precio) || precio < 0) {
                 throw new Error(`El precio de ${producto.nombre_producto} no es válido.`);
             }
+            const aprobadoItem = cantidadesAprobadas.get(id);
+            if (!aprobadoItem || aprobadoItem.cantidad !== cantidad ||
+                Math.round(Number(aprobadoItem.precio) * 100) !== Math.round(precio * 100)) {
+                throw errorPreaprobacionDesactualizada(
+                    `El precio o la cantidad de ${producto.nombre_producto} cambió desde su aprobación.`
+                );
+            }
             const subtotal = precio * cantidad;
             total += subtotal;
             detalles.push({ ...producto, cantidad, precio, subtotal });
+        }
+        if (cantidadesAprobadas.size !== detalles.length ||
+            (metodoPago === 'Cashea' && (total < 25 || !Number.isInteger(Number(nivelCashea)) ||
+                Number(nivelCashea) < 1 || Number(nivelCashea) > 6))) {
+            throw errorPreaprobacionDesactualizada(
+                'El carrito o las condiciones de Cashea cambiaron desde la aprobación.'
+            );
         }
 
         const [configuracion] = await conn.execute(
@@ -334,10 +435,20 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
 
         await conn.execute(
             `INSERT INTO whatsapp_solicitudes
-                (id_solicitud, origen, telefono_cliente, metodo_entrega, datos_entrega)
-             VALUES (?, 'whatsapp', ?, ?, ?)`,
-            [idSolicitud, almacenado, metodoEntrega, JSON.stringify(datosEntrega)]
+                (id_solicitud, origen, telefono_cliente, metodo_entrega, metodo_pago, datos_entrega)
+             VALUES (?, 'whatsapp', ?, ?, ?, ?)`,
+            [idSolicitud, almacenado, metodoEntrega, metodoPago, JSON.stringify(datosEntrega)]
         );
+
+        const [completed] = await conn.execute(
+            `UPDATE whatsapp_notificaciones
+             SET estado = 'completada', id_solicitud = ?
+             WHERE id = ? AND tipo = 'prepedido' AND estado = 'registrando'`,
+            [idSolicitud, preaprobacionId]
+        );
+        if (completed.affectedRows !== 1) {
+            throw new Error('No se pudo completar la preaprobación del pedido.');
+        }
 
         await conn.commit();
         return {
@@ -348,6 +459,7 @@ async function crearPedidoWhatsApp(pool, { telefono, nombre, cedula, carrito, me
             tasa,
             total,
             metodoEntrega,
+            metodoPago,
             datosEntrega,
             detalles
         };
@@ -418,7 +530,7 @@ async function marcarNotificacionFallida(pool, idNotificacion, errorMessage) {
 async function buscarNotificacionPorMensaje(pool, messageId, tipoGerencia) {
     const sufijo = tipoGerencia === 'delivery' ? 'D' : 'E';
     const [rows] = await pool.execute(
-        `SELECT n.id, n.client_jid, n.client_name, n.estado
+        `SELECT n.id, n.client_jid, n.client_name, n.estado, n.tipo, n.detalle, n.referencia
          FROM whatsapp_notificacion_mensajes m
          INNER JOIN whatsapp_notificaciones n ON n.id = m.id_notificacion
          WHERE m.manager_message_id = ? AND n.referencia LIKE ?
@@ -428,10 +540,48 @@ async function buscarNotificacionPorMensaje(pool, messageId, tipoGerencia) {
     return rows[0] || null;
 }
 
+async function buscarPrepedidoActivo(pool, clientJid) {
+    const [rows] = await pool.execute(
+        `SELECT id, referencia, client_jid, client_name, estado, detalle
+         FROM whatsapp_notificaciones
+         WHERE client_jid = ? AND tipo = 'prepedido'
+           AND estado IN ('enviada', 'aprobada')
+         ORDER BY creado_en DESC
+         LIMIT 1`,
+        [clientJid]
+    );
+    return rows[0] || null;
+}
+
+async function registrarDecisionPrepedido(pool, idNotificacion, decision, respuesta) {
+    if (!['aprobada', 'rechazada'].includes(decision)) {
+        throw new Error('La decisión de preaprobación no es válida.');
+    }
+
+    const [result] = await pool.execute(
+        `UPDATE whatsapp_notificaciones
+         SET estado = ?, respuesta_gerencia = ?, respondida_en = NOW()
+         WHERE id = ? AND tipo = 'prepedido' AND estado = 'enviada'`,
+        [decision, respuesta, idNotificacion]
+    );
+    return result.affectedRows === 1;
+}
+
+async function cancelarPrepedido(pool, idNotificacion, clientJid) {
+    const [result] = await pool.execute(
+        `UPDATE whatsapp_notificaciones
+         SET estado = 'cancelada'
+         WHERE id = ? AND client_jid = ? AND tipo = 'prepedido'
+           AND estado IN ('enviada', 'aprobada')`,
+        [idNotificacion, clientJid]
+    );
+    return result.affectedRows === 1;
+}
+
 async function buscarNotificacionesPendientesGerencia(pool, tipoGerencia) {
     const sufijo = tipoGerencia === 'delivery' ? 'D' : 'E';
     const [rows] = await pool.execute(
-        `SELECT id, client_jid, client_name, estado
+        `SELECT id, client_jid, client_name, estado, tipo, detalle, referencia
          FROM whatsapp_notificaciones
          WHERE estado = 'enviada' AND referencia LIKE ?
          ORDER BY creado_en DESC
@@ -455,7 +605,7 @@ async function cancelarNotificacionesCliente(pool, clientJid) {
     const [result] = await pool.execute(
         `UPDATE whatsapp_notificaciones
          SET estado = 'cancelada'
-         WHERE client_jid = ? AND estado IN ('pendiente', 'enviada')`,
+         WHERE client_jid = ? AND estado IN ('pendiente', 'enviada', 'aprobada')`,
         [clientJid]
     );
     return result.affectedRows;
@@ -475,8 +625,12 @@ module.exports = {
     marcarNotificacionFallida,
     registrarMensajeGerencia,
     registrarRespuestaGerencia,
+    buscarPrepedidoActivo,
+    registrarDecisionPrepedido,
+    cancelarPrepedido,
     registrarFeedbackIA,
     obtenerFeedbackIA,
     CATEGORIAS_FEEDBACK_IA,
-    cancelarNotificacionesCliente
+    cancelarNotificacionesCliente,
+    METODOS_PAGO
 };

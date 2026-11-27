@@ -10,15 +10,22 @@ const {
     detectarSolicitudNoContacto,
     detectarDudaCompra,
     detectarNivelCashea,
+    interpretarMetodoPago,
+    interpretarDecisionPrepedido,
+    confirmarSolicitud,
+    resolverProductoDeOpciones,
     describirPagoCashea,
     obtenerTotalCarrito,
     cumpleMontoMinimoCashea,
     palabraANumero,
     respuestaGerenciaEsAmbigua,
+    crearFichaPrepedido,
+    serializarPrepedido,
+    reconstruirSesionPrepedido,
     procesarFlujoPedido
 } = require('./bot');
 
-test('Cashea asks for a level and then shows a clear final confirmation for the active order', async () => {
+test('Cashea requires a level and the manager pre-order shows its terms clearly', async () => {
     const sentMessages = [];
     const sock = {
         async sendMessage(jid, message) {
@@ -27,9 +34,11 @@ test('Cashea asks for a level and then shows a clear final confirmation for the 
     };
     const sesion = {
         etapa: 'cashea_nivel',
-        carrito: [{ nombre_producto: 'Muñón Corsa', cantidad: 2, precio: 20 }],
+        carrito: [{ id_producto: 7, codigo: 'M-7', nombre_producto: 'Muñón Corsa', cantidad: 2, precio: 20 }],
         metodoEntrega: 'Retiro en Local',
-        datosEntrega: {}
+        datosEntrega: {},
+        cliente: { nombre: 'Cliente de Prueba', cedula: '12345678' },
+        telefono: '584121234567'
     };
 
     await procesarFlujoPedido(sock, 'cliente-3', 'Confirmar', null, sesion);
@@ -38,12 +47,18 @@ test('Cashea asks for a level and then shows a clear final confirmation for the 
     assert.match(sentMessages[0].text, /OTRO PAGO/);
     assert.match(sentMessages[0].text, /Aún no se ha registrado/);
 
-    await procesarFlujoPedido(sock, 'cliente-3', '2', null, sesion);
-    assert.equal(sesion.etapa, 'confirmar_pedido');
-    assert.match(sentMessages[1].text, /Muñón Corsa/);
-    assert.match(sentMessages[1].text, /Total: \$40\.00/);
-    assert.match(sentMessages[1].text, /Cashea.*nivel 2.*inicial 50% \(\$20\.00\)/);
-    assert.match(sentMessages[1].text, /Responde \*CONFIRMAR\*/);
+    sesion.nivelCashea = 2;
+    sesion.metodoPago = 'Cashea';
+    const ficha = crearFichaPrepedido(sesion, 'PRE-TEST');
+    assert.match(ficha, /Total estimado: \$40\.00/);
+    assert.match(ficha, /nivel 2.*inicial 50% \(\$20\.00\)/);
+    assert.match(ficha, /APROBAR/);
+    assert.match(ficha, /ni reserva inventario/);
+
+    const restaurada = reconstruirSesionPrepedido(serializarPrepedido(sesion));
+    assert.equal(restaurada.etapa, 'confirmar_pedido');
+    assert.equal(restaurada.metodoPago, 'Cashea');
+    assert.equal(restaurada.nivelCashea, 2);
 });
 
 test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
@@ -66,6 +81,51 @@ test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
     assert.equal(cumpleMontoMinimoCashea(25), true);
     assert.equal(respuestaGerenciaEsAmbigua('Confirmar'), true);
     assert.equal(respuestaGerenciaEsAmbigua('Cashea validado para nivel 2.'), false);
+    assert.equal(interpretarMetodoPago('divisa'), 'Divisa (USD)');
+    assert.equal(interpretarMetodoPago('pago móvil'), 'Pago móvil');
+    assert.equal(interpretarMetodoPago('Zelle'), null);
+    assert.deepEqual(interpretarDecisionPrepedido('APROBAR'), { decision: 'aprobada', motivo: '' });
+    assert.deepEqual(interpretarDecisionPrepedido('RECHAZAR: sin disponibilidad'), {
+        decision: 'rechazada',
+        motivo: 'sin disponibilidad'
+    });
+    assert.equal(interpretarDecisionPrepedido('Confirmar'), null);
+    assert.equal(confirmarSolicitud('Confirmar pedido'), true);
+    assert.equal(confirmarSolicitud('Confirmar'), true);
+    assert.equal(confirmarSolicitud('Sí'), false);
+});
+
+test('selects additional cart items by displayed number, SKU, or brand', () => {
+    const products = [
+        {
+            codigo: '92099365',
+            nombre_producto: 'Muñón Corsa largo GM',
+            marca_repuesto: 'GM HE',
+            marca_carro: 'Chevrolet',
+            modelo_vehiculo: 'Corsa'
+        },
+        {
+            codigo: 'TVA-90444294',
+            nombre_producto: 'Muñón Corsa todos largo',
+            marca_repuesto: 'TVA',
+            marca_carro: 'Chevrolet',
+            modelo_vehiculo: 'Corsa'
+        },
+        {
+            codigo: 'TVA-11111',
+            nombre_producto: 'Muñón Aveo',
+            marca_repuesto: 'TVA',
+            marca_carro: 'Chevrolet',
+            modelo_vehiculo: 'Aveo'
+        }
+    ];
+
+    assert.equal(resolverProductoDeOpciones(products, '2').producto, products[1]);
+    assert.equal(resolverProductoDeOpciones(products, 'TVA-90444294').producto, products[1]);
+    assert.equal(resolverProductoDeOpciones(products, 'GM HE').producto, products[0]);
+    assert.equal(resolverProductoDeOpciones(products, 'la marca GM HE').producto, products[0]);
+    assert.equal(resolverProductoDeOpciones(products, 'el de la marca GM HE').producto, products[0]);
+    assert.deepEqual(resolverProductoDeOpciones(products, 'TVA').productos, [products[1], products[2]]);
 });
 
 test('accepts natural quantity phrasing without misreading longer messages', () => {

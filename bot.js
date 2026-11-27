@@ -11,6 +11,8 @@ const {
     buscarClientePorTelefono,
     buscarNotificacionPorMensaje,
     buscarNotificacionesPendientesGerencia,
+    buscarPrepedidoActivo,
+    cancelarPrepedido,
     crearNotificacion,
     crearPedidoWhatsApp,
     marcarNotificacionFallida,
@@ -19,9 +21,11 @@ const {
     normalizarNumeroWhatsApp,
     registrarMensajeGerencia,
     registrarRespuestaGerencia,
+    registrarDecisionPrepedido,
     registrarFeedbackIA,
     obtenerFeedbackIA,
     CATEGORIAS_FEEDBACK_IA,
+    METODOS_PAGO,
     cancelarNotificacionesCliente,
     obtenerTelefonoDueno,
     registrarError,
@@ -598,6 +602,71 @@ function respuestaGerenciaEsAmbigua(texto) {
     );
 }
 
+function interpretarMetodoPago(texto) {
+    const respuesta = normalizarFrase(texto);
+    const porNumero = {
+        '1': 'Cashea',
+        '2': 'Efectivo',
+        '3': 'Divisa (USD)',
+        '4': 'Pago móvil',
+        '5': 'Transferencia'
+    };
+    if (porNumero[respuesta]) return porNumero[respuesta];
+    if (/\bcashea\b/.test(respuesta)) return 'Cashea';
+    if (/\b(?:efectivo|cash)\b/.test(respuesta)) return 'Efectivo';
+    if (/\b(?:divisa|dolares?|usd)\b/.test(respuesta)) return 'Divisa (USD)';
+    if (/\b(?:pago movil|movil)\b/.test(respuesta)) return 'Pago móvil';
+    if (/\btransferencia\b/.test(respuesta)) return 'Transferencia';
+    return null;
+}
+
+function interpretarDecisionPrepedido(texto) {
+    const respuesta = normalizarFrase(texto);
+    if (respuesta === 'aprobar') return { decision: 'aprobada', motivo: '' };
+    const rechazo = sinAcentos(String(texto || '')).trim().match(/^rechazar(?:\s*:\s*(.+))?$/i);
+    if (rechazo) return { decision: 'rechazada', motivo: rechazo[1] || '' };
+    return null;
+}
+
+function confirmarSolicitud(texto) {
+    return /^confirmar(?:\s+(?:pedido|solicitud))?$/.test(normalizarFrase(texto));
+}
+
+function resolverProductoDeOpciones(productos, texto) {
+    const seleccion = detectarSeleccion(texto);
+    if (seleccion?.tipo === 'numero') {
+        const producto = productos[seleccion.valor - 1];
+        return producto ? { producto } : null;
+    }
+    if (seleccion?.tipo === 'primero') return productos[0] ? { producto: productos[0] } : null;
+
+    const consulta = normalizarFrase(texto);
+    const codigo = consulta.replace(/[\s-]/g, '');
+    const porCodigo = productos.filter((producto) =>
+        String(producto.codigo || '').toLowerCase().replace(/[\s-]/g, '') === codigo
+    );
+    if (porCodigo.length === 1) return { producto: porCodigo[0] };
+
+    const marcaExplicita = consulta.match(/^(?:el|la)\s+(?:de\s+)?(?:la\s+)?(?:marca\s+)?(.+)$/);
+    const textoCriterio = seleccion?.tipo === 'marca'
+        ? seleccion.texto
+        : (marcaExplicita?.[1] || consulta);
+    const criterio = normalizarFrase(textoCriterio.replace(/^(?:de\s+)?(?:la\s+)?marca\s+/, ''));
+    if (!criterio || criterio.length < 2) return null;
+    const coincidentes = productos.filter((producto) => {
+        const nombre = normalizarFrase(producto.nombre_producto);
+        const marca = normalizarFrase(producto.marca_repuesto);
+        const vehiculo = normalizarFrase(
+            `${producto.marca_carro || ''} ${producto.modelo_vehiculo || ''}`
+        );
+        return nombre.includes(criterio) || marca === criterio ||
+            vehiculo.includes(criterio) || criterio === marca;
+    });
+    if (coincidentes.length === 1) return { producto: coincidentes[0] };
+    if (coincidentes.length > 1) return { productos: coincidentes };
+    return null;
+}
+
 // ============================================================
 // DETECCIÓN DE INTENCIONES (fallback sin IA)
 // ============================================================
@@ -1070,7 +1139,7 @@ function formatearProductos(productos, tasa) {
     });
 
     texto += `_Los precios en Bs se calculan con la tasa del día._\n\n`;
-    texto += `💡 _Responde con el número o el nombre del producto que te interese_\n\n`;
+    texto += `💡 _Elige por número, nombre, código o marca_\n\n`;
     texto += `🛒 Ver más productos: ${CONFIG.catalogo}`;
 
     return texto;
@@ -1250,6 +1319,23 @@ function textoOpcionesEntrega() {
         '_Escribe *CANCELAR* en cualquier momento para cancelar el pedido._';
 }
 
+function textoOpcionesPago() {
+    return '¿Qué método de pago prefieres?\n\n' +
+        '1️⃣ Cashea\n' +
+        '2️⃣ Efectivo\n' +
+        '3️⃣ Divisa (USD en efectivo)\n' +
+        '4️⃣ Pago móvil\n' +
+        '5️⃣ Transferencia\n\n' +
+        'Responde con el número o el nombre. No aceptamos Zelle.\n' +
+        '_Escribe *CANCELAR* para cancelar el pedido._';
+}
+
+async function iniciarSeleccionPago(sock, jid, sesion) {
+    sesion.etapa = 'metodo_pago';
+    guardarSesion(jid, sesion);
+    await sock.sendMessage(jid, { text: textoOpcionesPago() });
+}
+
 async function iniciarDatosEntrega(sock, jid, sesion) {
     const cliente = await buscarClientePorTelefono(pool, sesion.telefono);
     if (cliente) {
@@ -1277,6 +1363,90 @@ async function iniciarDatosEntrega(sock, jid, sesion) {
     guardarSesion(jid, sesion);
     await sock.sendMessage(jid, {
         text: 'Para registrar tu pedido, envíame tu nombre y apellido completos.\n\n_Escribe *CANCELAR* para cancelar._'
+    });
+}
+
+function crearFichaPrepedido(sesion, referencia) {
+    const productos = sesion.carrito.map((item) =>
+        `• ${item.nombre_producto} (${item.codigo || `ID ${item.id_producto}`}) x ${item.cantidad} — $${(item.precio * item.cantidad).toFixed(2)}`
+    ).join('\n');
+    const total = obtenerTotalCarrito(sesion);
+    const pago = sesion.metodoPago === 'Cashea'
+        ? `${describirPagoCashea(total, sesion.nivelCashea)}`
+        : sesion.metodoPago;
+    const entrega = sesion.metodoEntrega === 'Retiro en Local'
+        ? 'Retiro en local'
+        : sesion.metodoEntrega === 'Delivery Local'
+            ? sesion.datosEntrega.ubicacion?.enlace || sesion.datosEntrega.direccion
+            : `${sesion.datosEntrega.agencia}, ${sesion.datosEntrega.ciudad}, ${sesion.datosEntrega.estado}`;
+
+    return [
+        '📝 SOLICITUD DE PEDIDO — PENDIENTE DE REVISIÓN',
+        `Referencia: ${referencia}`,
+        `Cliente: ${sesion.cliente.nombre}`,
+        `Teléfono: ${sesion.telefono}`,
+        `Productos:\n${productos}`,
+        `Total estimado: $${total.toFixed(2)}`,
+        `Entrega: ${sesion.metodoEntrega} — ${entrega}`,
+        `Pago seleccionado: ${pago}`,
+        '',
+        'Revisa disponibilidad, precio y modalidad de pago. Responde citando esta ficha:',
+        '*APROBAR* para enviar el resumen al cliente, o *RECHAZAR: motivo* para no continuar.',
+        'No respondas solo “Confirmar”. La solicitud no está registrada ni reserva inventario.'
+    ].join('\n\n');
+}
+
+function serializarPrepedido(sesion) {
+    return JSON.stringify({
+        telefono: sesion.telefono,
+        nombreWhatsApp: sesion.nombreWhatsApp,
+        cliente: sesion.cliente,
+        carrito: sesion.carrito,
+        metodoEntrega: sesion.metodoEntrega,
+        metodoPago: sesion.metodoPago,
+        nivelCashea: sesion.nivelCashea || null,
+        datosEntrega: sesion.datosEntrega
+    });
+}
+
+function reconstruirSesionPrepedido(detalle) {
+    let datos;
+    try {
+        datos = JSON.parse(detalle);
+    } catch (error) {
+        throw new Error('No se pudo leer el detalle de la preaprobación del pedido.', { cause: error });
+    }
+
+    if (!datos || !Array.isArray(datos.carrito) || !datos.cliente?.cedula ||
+        !datos.metodoEntrega || !datos.metodoPago) {
+        throw new Error('La preaprobación no contiene los datos necesarios para crear el pedido.');
+    }
+    return {
+        ...datos,
+        etapa: 'confirmar_pedido'
+    };
+}
+
+async function enviarPreaprobacionPedido(sock, jid, sesion) {
+    const referencia = `PRE-${Date.now().toString(36).toUpperCase()}`;
+    await enviarNotificacionContactos(sock, {
+        tipo: 'prepedido',
+        referencia,
+        clientJid: jid,
+        nombre: sesion.cliente.nombre,
+        telefono: sesion.telefono,
+        detalle: serializarPrepedido(sesion)
+    }, crearFichaPrepedido(sesion, referencia),
+    sesion.metodoEntrega === 'Delivery Local' ? 'pedido' : 'envio',
+    referencia);
+
+    sesion.etapa = 'esperando_aprobacion';
+    sesion.referenciaPrepedido = referencia;
+    guardarSesion(jid, sesion);
+    await sock.sendMessage(jid, {
+        text: `Envié tu solicitud ${referencia} a gerencia para verificar disponibilidad, precio y pago. ` +
+            'Todavía no es un pedido confirmado y no se ha reservado inventario. ' +
+            'Te escribiré cuando la revisen. Responde *CANCELAR* si ya no deseas continuar.'
     });
 }
 
@@ -1315,6 +1485,8 @@ function crearFichaDespacho(pedido, referencia) {
             'Validar la aplicación con Cashea; el pedido aún no representa aprobación ni pago recibido.',
             'Si respondes a esta ficha, escribe el mensaje completo para el cliente. No respondas solo “Confirmar”; tu texto se reenvía literalmente.'
         ] : []),
+        `💳 Método de pago: ${pedido.metodoPago}`,
+        '✅ Previamente revisado por gerencia. El pago aún no se ha recibido.',
         `🚚 Método de entrega: ${pedido.metodoEntrega}`,
         `📍 Ubicación / Datos de envío:\n${entregaTexto}`
     ].join('\n\n');
@@ -1342,23 +1514,38 @@ async function solicitarConfirmacionPedido(sock, jid, sesion) {
         text: `Revisa tu pedido:\n${productos}\n\n` +
             `💵 Total: $${total.toFixed(2)}\n` +
             `🚚 ${sesion.metodoEntrega}: ${entregaTexto}\n\n` +
-            (sesion.nivelCashea
+            (sesion.metodoPago === 'Cashea'
                 ? `💳 ${describirPagoCashea(total, sesion.nivelCashea)}\n\n`
-                : '💳 Pago: por definir al confirmar con ventas.\n\n') +
-            'Responde *CONFIRMAR* para registrar el pedido o *CANCELAR* para descartarlo. ' +
-            'El inventario y los precios se validarán al confirmar.'
+                : `💳 Pago: ${sesion.metodoPago}\n\n`) +
+            'Gerencia revisó disponibilidad, precio y forma de pago. Responde *CONFIRMAR* para registrar el pedido ' +
+            'o *CANCELAR* para descartarlo. El inventario se comprobará de nuevo al registrarlo.'
     });
 }
 
-async function finalizarPedido(sock, jid, sesion) {
-    const pedido = await crearPedidoWhatsApp(pool, {
-        telefono: sesion.telefono,
-        nombre: sesion.cliente.nombre,
-        cedula: sesion.cliente.cedula,
-        carrito: sesion.carrito,
-        metodoEntrega: sesion.metodoEntrega,
-        datosEntrega: sesion.datosEntrega
-    });
+async function finalizarPedido(sock, jid, sesion, preaprobacionId) {
+    let pedido;
+    try {
+        pedido = await crearPedidoWhatsApp(pool, {
+            telefono: sesion.telefono,
+            nombre: sesion.cliente.nombre,
+            cedula: sesion.cliente.cedula,
+            carrito: sesion.carrito,
+            metodoEntrega: sesion.metodoEntrega,
+            metodoPago: sesion.metodoPago,
+            nivelCashea: sesion.nivelCashea || null,
+            datosEntrega: sesion.datosEntrega,
+            preaprobacionId
+        });
+    } catch (error) {
+        if (error.code !== 'PREAPROBACION_DESACTUALIZADA') throw error;
+        await cancelarPrepedido(pool, preaprobacionId, jid);
+        limpiarSesion(jid);
+        await sock.sendMessage(jid, {
+            text: 'No registré el pedido: cambió el precio, la disponibilidad o los datos aprobados. ' +
+                'No se reservó inventario. Escríbeme de nuevo para revisar y enviar una solicitud actualizada a gerencia.'
+        });
+        return;
+    }
     pedido.nivelCashea = sesion.nivelCashea || null;
     limpiarSesion(jid);
 
@@ -1372,7 +1559,7 @@ async function finalizarPedido(sock, jid, sesion) {
             detalle: JSON.stringify({
                 metodoEntrega: pedido.metodoEntrega,
                 datosEntrega: pedido.datosEntrega,
-                metodoPago: sesion.nivelCashea ? 'Cashea' : null,
+                metodoPago: sesion.metodoPago,
                 nivelCashea: sesion.nivelCashea || null
             })
         }, crearFichaDespacho(pedido, pedido.codigo),
@@ -1382,9 +1569,7 @@ async function finalizarPedido(sock, jid, sesion) {
         await sock.sendMessage(jid, {
             text: `✅ Pedido ${pedido.codigo} registrado y enviado a gerencia para coordinar el despacho.\n` +
                 `🚚 Entrega: ${pedido.metodoEntrega}.\n` +
-                (sesion.nivelCashea
-                    ? `💳 Pago solicitado: Cashea, nivel ${sesion.nivelCashea}. La aplicación queda pendiente de validación por ventas; este mensaje no confirma aprobación ni pago.\n`
-                    : '') +
+                `💳 Pago seleccionado: ${sesion.metodoPago}. El pago aún no se ha recibido.\n` +
                 `Referencia: ${referencia}.`
         });
     } catch (error) {
@@ -1394,6 +1579,52 @@ async function finalizarPedido(sock, jid, sesion) {
                 'Por favor, contacta directamente a la tienda para confirmar el despacho.'
         });
     }
+}
+
+async function procesarDecisionPrepedido(sock, jidGerencia, notificacion, texto) {
+    const decision = interpretarDecisionPrepedido(texto);
+    if (!decision) {
+        await sock.sendMessage(jidGerencia, {
+            text: 'Esta solicitud está pendiente de revisión. Responde citando la ficha con *APROBAR* o ' +
+                '*RECHAZAR: motivo*. Esa respuesta no se reenvía literalmente al cliente.'
+        });
+        return;
+    }
+
+    const actualizada = await registrarDecisionPrepedido(
+        pool,
+        notificacion.id,
+        decision.decision,
+        texto.trim()
+    );
+    if (!actualizada) {
+        await sock.sendMessage(jidGerencia, {
+            text: 'Esta solicitud ya fue atendida o cancelada; no se aplicó otra decisión.'
+        });
+        return;
+    }
+
+    if (decision.decision === 'rechazada') {
+        limpiarSesion(notificacion.client_jid);
+        const motivo = decision.motivo ? ` Motivo: ${decision.motivo}.` : '';
+        await sock.sendMessage(notificacion.client_jid, {
+            text: `Gerencia no pudo aprobar la solicitud ${notificacion.referencia}.${motivo} ` +
+                'No se registró el pedido ni se reservó inventario. Puedes escribirnos para cambiar el producto o la entrega.'
+        });
+        await sock.sendMessage(jidGerencia, {
+            text: `Solicitud ${notificacion.referencia} rechazada; se notificó al cliente y no se creó ningún pedido.`
+        });
+        return;
+    }
+
+    const sesion = reconstruirSesionPrepedido(notificacion.detalle);
+    sesion.preaprobacionId = notificacion.id;
+    sesion.referenciaPrepedido = notificacion.referencia;
+    await solicitarConfirmacionPedido(sock, notificacion.client_jid, sesion);
+    await sock.sendMessage(jidGerencia, {
+        text: `Solicitud ${notificacion.referencia} aprobada. Se envió el resumen al cliente; ` +
+            'el pedido solo se registrará cuando confirme.'
+    });
 }
 
 function palabraANumero(texto) {
@@ -1518,7 +1749,7 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
         const respuesta = normalizarFrase(texto);
         if (['otro pago', 'sin cashea', 'no cashea'].includes(respuesta)) {
             delete sesion.nivelCashea;
-            await solicitarConfirmacionPedido(sock, jid, sesion);
+            await iniciarSeleccionPago(sock, jid, sesion);
             return true;
         }
 
@@ -1535,7 +1766,38 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
         }
 
         sesion.nivelCashea = nivel;
-        await solicitarConfirmacionPedido(sock, jid, sesion);
+        sesion.metodoPago = 'Cashea';
+        await enviarPreaprobacionPedido(sock, jid, sesion);
+        return true;
+    }
+
+    if (sesion.etapa === 'metodo_pago') {
+        const metodoPago = interpretarMetodoPago(texto);
+        if (!metodoPago) {
+            await sock.sendMessage(jid, { text: textoOpcionesPago() });
+            return true;
+        }
+        if (metodoPago === 'Cashea') {
+            const total = obtenerTotalCarrito(sesion);
+            if (!cumpleMontoMinimoCashea(total)) {
+                await sock.sendMessage(jid, {
+                    text: `El total de $${total.toFixed(2)} no llega al mínimo de $${CONFIG_CASHEA.montoMinimo} de Cashea. ` +
+                        'Elige otra forma de pago o escribe *CANCELAR*.'
+                });
+                return true;
+            }
+            sesion.etapa = 'cashea_nivel';
+            guardarSesion(jid, sesion);
+            await sock.sendMessage(jid, {
+                text: `${describirCondicionesCashea()}\n\n` +
+                    `El total de tu carrito es $${total.toFixed(2)}. Indica tu nivel de Cashea (1–6). ` +
+                    'Gerencia revisará la solicitud antes de que confirmes el pedido.'
+            });
+            return true;
+        }
+
+        sesion.metodoPago = metodoPago;
+        await enviarPreaprobacionPedido(sock, jid, sesion);
         return true;
     }
 
@@ -1570,7 +1832,7 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
         if (numOpcion === 1 || opcion.includes('retiro') || opcion.includes('local') || opcion.includes('paso') || opcion.includes('busco')) {
             sesion.metodoEntrega = 'Retiro en Local';
             sesion.datosEntrega = {};
-            await solicitarConfirmacionPedido(sock, jid, sesion);
+            await iniciarSeleccionPago(sock, jid, sesion);
             return true;
         }
         if (numOpcion === 2 || opcion.includes('delivery') || (opcion.includes('local') && !opcion.includes('retiro'))) {
@@ -1606,7 +1868,7 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
             await sock.sendMessage(jid, { text: 'Comparte un punto GPS o escribe tu dirección exacta.\n\n_Escribe *CANCELAR* para cancelar._' });
             return true;
         }
-        await solicitarConfirmacionPedido(sock, jid, sesion);
+        await iniciarSeleccionPago(sock, jid, sesion);
         return true;
     }
 
@@ -1656,7 +1918,7 @@ async function procesarFlujoPedido(sock, jid, texto, ubicacion, sesion) {
         guardarSesion(jid, sesion);
         await sock.sendMessage(jid, { text: campo.pregunta });
     } else {
-        await solicitarConfirmacionPedido(sock, jid, sesion);
+        await iniciarSeleccionPago(sock, jid, sesion);
     }
     return true;
 }
@@ -1786,6 +2048,11 @@ async function procesarMensaje(sock, msg) {
                 return;
             }
 
+            if (notificacion.tipo === 'prepedido') {
+                await procesarDecisionPrepedido(sock, jid, notificacion, texto);
+                return;
+            }
+
             if (respuestaGerenciaEsAmbigua(texto)) {
                 await sock.sendMessage(jid, {
                     text: 'No reenvié esa respuesta porque “Confirmar” por sí solo no explica al cliente qué se validó. ' +
@@ -1827,6 +2094,44 @@ async function procesarMensaje(sock, msg) {
 
     const pushName = (msg.pushName || 'Cliente').trim();
     const sesion = obtenerSesion(jid);
+    const prepedido = await buscarPrepedidoActivo(pool, jid);
+
+    if (prepedido) {
+        const respuesta = normalizarFrase(texto);
+        if (respuesta === 'cancelar' || respuesta === 'cancelar solicitud') {
+            const cancelado = await cancelarPrepedido(pool, prepedido.id, jid);
+            limpiarSesion(jid);
+            await sock.sendMessage(jid, {
+                text: cancelado
+                    ? `Cancelé la solicitud ${prepedido.referencia}. No se registró el pedido ni se reservó inventario.`
+                    : 'La solicitud ya fue atendida y no se pudo cancelar desde este chat.'
+            });
+            return;
+        }
+
+        if (prepedido.estado === 'enviada') {
+            await sock.sendMessage(jid, {
+                text: `Tu solicitud ${prepedido.referencia} sigue pendiente de revisión por gerencia. ` +
+                    'No es un pedido confirmado ni se ha reservado inventario. Escribe *CANCELAR* si deseas detenerla.'
+            });
+            return;
+        }
+
+        if (prepedido.estado === 'aprobada' && confirmarSolicitud(texto)) {
+            const sesionAprobada = reconstruirSesionPrepedido(prepedido.detalle);
+            sesionAprobada.preaprobacionId = prepedido.id;
+            sesionAprobada.referenciaPrepedido = prepedido.referencia;
+            await finalizarPedido(sock, jid, sesionAprobada, prepedido.id);
+            return;
+        }
+
+        await sock.sendMessage(jid, {
+            text: `Gerencia aprobó la solicitud ${prepedido.referencia}. ` +
+                'Responde *CONFIRMAR* para registrar el pedido o *CANCELAR* para descartarlo.'
+        });
+        return;
+    }
+
     if (sesion && texto.trim().toLowerCase() === 'cancelar') {
         limpiarSesion(jid);
         await sock.sendMessage(jid, { text: 'Pedido cancelado. Cuando quieras, dime qué repuesto buscas.' });
@@ -1855,7 +2160,7 @@ async function procesarMensaje(sock, msg) {
         return;
     }
 
-    if (detectarConsultaCashea(texto)) {
+    if (detectarConsultaCashea(texto) && sesion?.etapa !== 'metodo_pago') {
         if (sesion?.etapa === 'confirmar_pedido') {
             const total = obtenerTotalCarrito(sesion);
             if (!cumpleMontoMinimoCashea(total)) {
@@ -1903,26 +2208,50 @@ async function procesarMensaje(sock, msg) {
     }
 
     if (sesion && ['resultados', 'seleccion_adicional'].includes(sesion.etapa)) {
-        const numPalabra = palabraANumero(texto);
-        const seleccionNum = numPalabra !== null ? { tipo: 'numero', valor: numPalabra } : null;
-        const seleccion = seleccionNum || detectarSeleccion(texto);
-        if (seleccion) {
-            const productoElegido = resolverSeleccion(sesion, seleccion);
-            if (productoElegido) {
-                const esAdicional = sesion.etapa === 'seleccion_adicional';
-                const tasa = await obtenerTasa();
-                sesion.producto = productoElegido;
-                sesion.productoAdicional = esAdicional;
-                if (!esAdicional) sesion.carrito = [];
-                sesion.nombreWhatsApp = pushName;
-                sesion.telefono = numeroCliente;
-                sesion.etapa = 'cantidad';
+        const resolucion = resolverProductoDeOpciones(sesion.productos || [], texto);
+        const esAdicional = sesion.etapa === 'seleccion_adicional';
+
+        if (resolucion?.productos) {
+            sesion.productos = resolucion.productos;
+            guardarSesion(jid, sesion);
+            await sock.sendMessage(jid, {
+                text: `${formatearProductos(resolucion.productos, await obtenerTasa())}\n\n` +
+                    'Hay varias opciones de esa marca. Elige por número, código o nombre.'
+            });
+            return;
+        }
+
+        let productoElegido = resolucion?.producto || null;
+        if (!productoElegido && esAdicional) {
+            const productos = await buscarProductos(texto);
+            if (productos.length > 0) {
+                sesion.productos = productos;
                 guardarSesion(jid, sesion);
-                const respuesta = respuestaSeleccion(productoElegido, tasa) +
-                    '\n\n¿Cuántas unidades deseas?\n\n_Escribe *CANCELAR* para cancelar._';
-                await sock.sendMessage(jid, { text: respuesta });
-                return;
+                await sock.sendMessage(jid, {
+                    text: `${formatearProductos(productos, await obtenerTasa())}\n\n` +
+                        'Elige el producto por número, código, marca o nombre.'
+                });
+            } else {
+                await sock.sendMessage(jid, {
+                    text: `No encontré opciones para "${texto}". Prueba con su código, marca o nombre, o escribe *no* para seguir sin agregarlo.`
+                });
             }
+            return;
+        }
+
+        if (productoElegido) {
+            const tasa = await obtenerTasa();
+            sesion.producto = productoElegido;
+            sesion.productoAdicional = esAdicional;
+            if (!esAdicional) sesion.carrito = [];
+            sesion.nombreWhatsApp = pushName;
+            sesion.telefono = numeroCliente;
+            sesion.etapa = 'cantidad';
+            guardarSesion(jid, sesion);
+            const respuesta = respuestaSeleccion(productoElegido, tasa) +
+                '\n\n¿Cuántas unidades deseas?\n\n_Escribe *CANCELAR* para cancelar._';
+            await sock.sendMessage(jid, { text: respuesta });
+            return;
         }
     }
 
@@ -2297,10 +2626,17 @@ module.exports = {
     detectarSeguimientoProducto,
     palabraANumero,
     detectarNivelCashea,
+    interpretarMetodoPago,
+    interpretarDecisionPrepedido,
+    confirmarSolicitud,
+    resolverProductoDeOpciones,
     describirPagoCashea,
     obtenerTotalCarrito,
     cumpleMontoMinimoCashea,
     respuestaGerenciaEsAmbigua,
+    crearFichaPrepedido,
+    serializarPrepedido,
+    reconstruirSesionPrepedido,
     procesarFlujoPedido,
     respuestaUbicacion,
     respuestaSaludo,
