@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     asegurarTablasWhatsApp,
+    buscarPrepedidoActivo,
     buscarNotificacionPorMensaje,
     buscarNotificacionesPendientesGerencia,
     cancelarNotificacionesCliente,
@@ -12,7 +13,9 @@ const {
     normalizarNumeroWhatsApp,
     registrarFeedbackIA,
     obtenerFeedbackIA,
-    registrarMensajeGerencia
+    registrarMensajeGerencia,
+    registrarDecisionPrepedido,
+    cancelarPrepedido
 } = require('../whatsapp-service');
 
 test('crea las tablas auxiliares de WhatsApp si aún no existen', async () => {
@@ -20,13 +23,15 @@ test('crea las tablas auxiliares de WhatsApp si aún no existen', async () => {
     await asegurarTablasWhatsApp({
         async execute(sql) {
             statements.push(sql);
+            return sql.includes('information_schema.COLUMNS') ? [[]] : [{}];
         }
     });
 
-    assert.equal(statements.length, 4);
+    assert.equal(statements.length, 6);
     assert.match(statements[0], /CREATE TABLE IF NOT EXISTS whatsapp_solicitudes/);
     assert.match(statements[1], /CREATE TABLE IF NOT EXISTS whatsapp_notificaciones/);
     assert.match(statements[3], /CREATE TABLE IF NOT EXISTS whatsapp_ia_feedback/);
+    assert.match(statements[5], /ADD COLUMN metodo_pago VARCHAR\(32\)/);
 });
 
 test('normaliza los contactos locales a JID de WhatsApp con código de país', () => {
@@ -85,7 +90,7 @@ test('normalizes the optional owner phone used by administrative commands', () =
 test('busca una respuesta citada solo entre las notificaciones de ese gerente', async () => {
     let consulta;
     let parametros;
-    const resultadoEsperado = { id: 3, estado: 'enviada' };
+    const resultadoEsperado = { id: 3, estado: 'enviada', tipo: 'prepedido', referencia: 'PRE-123-D' };
     const pool = {
         async execute(sql, valores) {
             consulta = sql;
@@ -99,6 +104,32 @@ test('busca una respuesta citada solo entre las notificaciones de ese gerente', 
     assert.equal(resultado, resultadoEsperado);
     assert.match(consulta, /m\.manager_message_id = \? AND n\.referencia LIKE \?/);
     assert.deepEqual(parametros, ['mensaje-123', '%-E']);
+});
+
+test('loads, approves, rejects, and cancels pre-orders with guarded status updates', async () => {
+    const calls = [];
+    const pool = {
+        async execute(sql, params) {
+            calls.push({ sql, params });
+            if (sql.includes('SELECT id, referencia')) {
+                return [[{ id: 9, estado: 'enviada', tipo: 'prepedido', detalle: '{}' }]];
+            }
+            return [{ affectedRows: 1 }];
+        }
+    };
+
+    const active = await buscarPrepedidoActivo(pool, 'client-jid');
+    assert.equal(active.id, 9);
+    assert.deepEqual(calls[0].params, ['client-jid']);
+
+    assert.equal(await registrarDecisionPrepedido(pool, 9, 'aprobada', 'APROBAR'), true);
+    assert.equal(await registrarDecisionPrepedido(pool, 9, 'rechazada', 'RECHAZAR: sin stock'), true);
+    await assert.rejects(registrarDecisionPrepedido(pool, 9, 'enviada', 'texto'), /decisión.*no es válida/i);
+    assert.equal(await cancelarPrepedido(pool, 9, 'client-jid'), true);
+
+    assert.match(calls[1].sql, /estado = 'enviada'/);
+    assert.deepEqual(calls[1].params, ['aprobada', 'APROBAR', 9]);
+    assert.match(calls[3].sql, /estado IN \('enviada', 'aprobada'\)/);
 });
 
 test('stores aggregate AI feedback by approved category without conversation content', async () => {
@@ -130,7 +161,7 @@ test('cancels outstanding sales notifications after a client requests no contact
     }, 'cliente@s.whatsapp.net');
 
     assert.equal(cantidadCancelada, 2);
-    assert.match(sql, /estado IN \('pendiente', 'enviada'\)/);
+    assert.match(sql, /estado IN \('pendiente', 'enviada', 'aprobada'\)/);
     assert.deepEqual(params, ['cliente@s.whatsapp.net']);
 });
 
@@ -167,7 +198,7 @@ test('solo usa una respuesta sin cita cuando el gerente tiene una notificación 
     assert.deepEqual(parametros, ['%-D']);
 });
 
-function crearPoolSimulado(stock = 10, fallaReserva = false) {
+function crearPoolSimulado(stock = 10, fallaReserva = false, fallaPreaprobacion = false, precioActual = 25) {
     const estado = {
         iniciada: false,
         confirmada: false,
@@ -190,6 +221,19 @@ function crearPoolSimulado(stock = 10, fallaReserva = false) {
         },
         async execute(sql) {
             estado.statements.push(sql);
+            if (sql.includes("SET estado = 'registrando'")) {
+                return [{ affectedRows: fallaPreaprobacion ? 0 : 1 }];
+            }
+            if (sql.includes('SELECT detalle FROM whatsapp_notificaciones')) {
+                return [[{
+                    detalle: JSON.stringify({
+                        carrito: [{ id_producto: 7, cantidad: 2, precio: 25 }],
+                        metodoEntrega: 'Delivery Local',
+                        metodoPago: 'Efectivo',
+                        nivelCashea: null
+                    })
+                }]];
+            }
             if (sql.includes('SELECT p.id_persona')) return [[]];
             if (sql.includes('INSERT INTO persona')) return [{ insertId: 12 }];
             if (sql.includes('INSERT INTO cliente')) return [{ insertId: 34 }];
@@ -208,7 +252,7 @@ function crearPoolSimulado(stock = 10, fallaReserva = false) {
                     id_producto: 7,
                     codigo: 'P-7',
                     nombre_producto: 'Amortiguador',
-                    precio: 25,
+                    precio: precioActual,
                     stock_actual: stock
                 }]];
             }
@@ -231,13 +275,14 @@ const pedido = {
     cedula: '12345678',
     carrito: [{ id_producto: 7, cantidad: 2 }],
     metodoEntrega: 'Delivery Local',
+    metodoPago: 'Efectivo',
     datosEntrega: { direccion: 'Av. Principal' }
 };
 
-test('crea el pedido, registra su origen y confirma la transacción', async () => {
+test('creates an approved request, records payment method, and commits the transaction', async () => {
     const { pool, estado } = crearPoolSimulado();
 
-    const resultado = await crearPedidoWhatsApp(pool, pedido);
+    const resultado = await crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 });
 
     assert.equal(resultado.idSolicitud, 56);
     assert.equal(resultado.codigo, 'SOL-000056');
@@ -248,15 +293,56 @@ test('crea el pedido, registra su origen y confirma la transacción', async () =
     assert.equal(estado.revertida, false);
     assert.equal(estado.liberada, true);
     assert.ok(estado.statements.some((sql) => sql.includes('INSERT INTO whatsapp_solicitudes')));
+    assert.ok(estado.statements.some((sql) => sql.includes('metodo_pago')));
     assert.ok(estado.statements.some((sql) => sql.includes('INSERT INTO detalle_solicitud')));
+});
+
+test('creates an approved WhatsApp pre-order transactionally before reserving stock', async () => {
+    const { pool, estado } = crearPoolSimulado();
+
+    const resultado = await crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 });
+
+    assert.equal(resultado.metodoPago, 'Efectivo');
+    assert.equal(estado.confirmada, true);
+    assert.ok(estado.statements.some((sql) => sql.includes("SET estado = 'registrando'")));
+    assert.ok(estado.statements.some((sql) => sql.includes("SET estado = 'completada'")));
+});
+
+test('requires a pre-approval and rejects a price that changed after manager review', async () => {
+    await assert.rejects(
+        crearPedidoWhatsApp({ async getConnection() { throw new Error('must not connect'); } }, pedido),
+        /Se requiere una preaprobación vigente/
+    );
+
+    const { pool, estado } = crearPoolSimulado(10, false, false, 30);
+    await assert.rejects(
+        crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 }),
+        { code: 'PREAPROBACION_DESACTUALIZADA' }
+    );
+    assert.equal(estado.confirmada, false);
+    assert.equal(estado.revertida, true);
+    assert.equal(estado.statements.some((sql) => sql.includes('INSERT INTO solicitud')), false);
+});
+
+test('refuses to create a request without a live manager pre-approval', async () => {
+    const { pool, estado } = crearPoolSimulado(10, false, true);
+
+    await assert.rejects(
+        crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 }),
+        /requiere aprobación vigente/
+    );
+
+    assert.equal(estado.confirmada, false);
+    assert.equal(estado.revertida, true);
+    assert.equal(estado.statements.some((sql) => sql.includes('INSERT INTO solicitud')), false);
 });
 
 test('revierte todos los cambios si no puede reservar el stock', async () => {
     const { pool, estado } = crearPoolSimulado(1);
 
     await assert.rejects(
-        crearPedidoWhatsApp(pool, pedido),
-        /Stock insuficiente/
+        crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 }),
+        { code: 'PREAPROBACION_DESACTUALIZADA' }
     );
 
     assert.equal(estado.iniciada, true);
@@ -273,7 +359,7 @@ test('revierte los detalles y el pedido si falla la actualización del inventari
     const { pool, estado } = crearPoolSimulado(10, true);
 
     await assert.rejects(
-        crearPedidoWhatsApp(pool, pedido),
+        crearPedidoWhatsApp(pool, { ...pedido, preaprobacionId: 99 }),
         /No se pudo reservar el stock/
     );
 
