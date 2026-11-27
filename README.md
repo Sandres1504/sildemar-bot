@@ -16,6 +16,12 @@ detección de intenciones como respaldo.
   entrega (Delivery Local / Envío Nacional) → confirmación → notificación a gerencia.
 - **Notificaciones a gerencia**: fichas de despacho y consultas de productos sin
   disponibilidad. La gerencia puede responder citando la notificación original.
+- **Cashea**: informa el mínimo de $25, tres cuotas y la inicial confirmada por
+  nivel (60% nivel 1, 50% nivel 2 y 40% niveles 3–6). Ventas valida la aplicación
+  al pedido antes de confirmarlo; el bot no procesa pagos ni promete aprobación.
+- **Corrección supervisada de IA**: el dueño puede registrar categorías de error
+  para reforzar las instrucciones de Gemini. Solo se guardan categorías y
+  contadores; no se guardan conversaciones ni datos de clientes para este fin.
 - **Filtros de mensajes**: ignora grupos, listas de precios, mensajes vacíos y
   mensajes propios del negocio.
 
@@ -28,6 +34,7 @@ detección de intenciones como respaldo.
    - `DATABASE_URL` (PostgreSQL Supabase para la sesión Baileys).
    - `GEMINI_API_KEY` (API key de Google AI Studio).
    - `GERENTE_DELIVERY_PHONE`, `GERENTE_SHIPPING_PHONE` (contactos de gerencia).
+   - `OWNER_PHONE` (número del dueño, necesario para comandos de supervisión).
 4. Inicia el bot con `npm start` y escanea el QR que aparece en la terminal.
 
 ### Obtener la API key de Gemini
@@ -52,12 +59,14 @@ detección de intenciones como respaldo.
 | `GEMINI_API_KEY` | API key de Google AI Studio (Gemini) |
 | `GERENTE_DELIVERY_PHONE` | Contacto de despacho local |
 | `GERENTE_SHIPPING_PHONE` | Contacto de envíos nacionales |
+| `OWNER_PHONE` | Número del dueño con código de país; habilita los comandos administrativos |
 | `PORT` | Puerto HTTP asignado por Render |
 
 ### Preparación de MySQL
 
 Al iniciar, el bot crea las tablas auxiliares `whatsapp_solicitudes` y
-`whatsapp_notificaciones` si no existen. El usuario MySQL de Render necesita
+`whatsapp_notificaciones`, `whatsapp_notificacion_mensajes` y
+`whatsapp_ia_feedback` si no existen. El usuario MySQL de Render necesita
 permiso `CREATE` en la base de datos. Si la política de cPanel no permite ese
 permiso, un administrador puede importar
 [`../backend/sql/whatsapp_integration.sql`](../backend/sql/whatsapp_integration.sql)
@@ -91,6 +100,18 @@ Después de guardar, haz un **Manual Deploy** o espera al redeploy automático.
    la solicitud y notifica a gerencia.
 6. Si Gemini falla o no está configurada, el bot cae al flujo tradicional de
    detección de intenciones por expresiones regulares.
+7. Las preguntas sobre Cashea se remiten a ventas para validar su aplicación al
+   pedido antes de confirmarlo. Ante una duda de compra, el bot ofrece ayuda sin insistir y
+   respeta un rechazo o una solicitud de no contacto.
+
+### Correcciones supervisadas de Gemini
+
+Desde el WhatsApp del dueño, usa `/corregir cashea`, `/corregir cierre`,
+`/corregir inventario` o `/corregir respeto` después de identificar una respuesta
+incorrecta. Gemini aplicará esas reglas en las siguientes respuestas y
+`/correcciones` mostrará las categorías registradas. El registro no incluye el
+mensaje, nombre, teléfono ni identificador del cliente; no es entrenamiento
+automático del modelo.
 
 ## Pruebas
 

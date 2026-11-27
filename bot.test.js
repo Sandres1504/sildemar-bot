@@ -2,9 +2,41 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     GeminiService,
+    construirPromptGemini,
     respuestaErrorGemini,
-    prepararConsultaProducto
+    prepararConsultaProducto,
+    detectarConsultaCashea,
+    respuestaCashea,
+    detectarSolicitudNoContacto,
+    detectarDudaCompra
 } = require('./bot');
+
+test('detects Cashea questions, opt-out requests, and sales hesitation', () => {
+    assert.equal(detectarConsultaCashea('¿Puedo pagar con Cashea?'), true);
+    assert.equal(detectarConsultaCashea('¿Tienen repuestos?'), false);
+    assert.match(respuestaCashea(), /mínimo es \$25/);
+    assert.match(respuestaCashea(), /3 cuotas/);
+    assert.match(respuestaCashea(), /60% para nivel 1, 50% para nivel 2 y 40% para niveles 3 al 6/);
+    assert.equal(detectarSolicitudNoContacto('No me escribas más, por favor'), true);
+    assert.equal(detectarSolicitudNoContacto('Lo voy a pensar'), false);
+    assert.equal(detectarDudaCompra('Lo veo después'), 'pausa');
+    assert.equal(detectarDudaCompra('No gracias'), 'rechazo');
+    assert.equal(detectarDudaCompra('¿Cuánto cuesta?'), null);
+});
+
+test('adds only predefined, customer-data-free human corrections to Gemini guidance', () => {
+    const prompt = construirPromptGemini([
+        { categoria: 'cashea' },
+        { categoria: 'inventario' },
+        { categoria: 'cashea' },
+        { categoria: 'unknown', detalle: 'No debe incluirse' }
+    ]);
+
+    assert.match(prompt, /condiciones confirmadas de Cashea/);
+    assert.match(prompt, /resultados reales del inventario/);
+    assert.equal((prompt.match(/condiciones confirmadas de Cashea/g) || []).length, 1);
+    assert.doesNotMatch(prompt, /No debe incluirse/);
+});
 
 test('Gemini service requests structured JSON and keeps only recent chat history', async () => {
     const requests = [];
